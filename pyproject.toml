@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dice-rl-robot"
+version = "0.1.0"
+description = "DICE-RL: RL Finetuning for Real Robot Manipulation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+
+dependencies = [
+    "numpy",
+    "torch",
+    "scipy",
+    "robotmq",
+    "hydra-core",
+    "omegaconf",
+    "dill",
+    "einops",
+    "tqdm",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+learner = [
+    "wandb",
+    "zarr==2.18",
+    "timm",
+    "diffusers",
+    "accelerate",
+    "matplotlib",
+    "plotly",
+    "pandas",
+    "numcodecs<0.16",
+    "imageio",
+    "imageio-ffmpeg",
+    "scikit-video",
+    "spatialmath-python",
+    "huggingface_hub",
+    "threadpoolctl",
+    "cvxpy",
+    "nbformat",
+    "imagecodecs",
+]
+robot = [
+    "wandb",
+    "zarr==2.18",
+    "timm",
+    "diffusers",
+    "accelerate",
+    "matplotlib",
+    "plotly",
+    "pandas",
+    "numcodecs<0.16",
+    "imageio",
+    "imageio-ffmpeg",
+    "scikit-video",
+    "spatialmath-python",
+    "huggingface_hub",
+    "threadpoolctl",
+    "cvxpy",
+    "nbformat",
+    "imagecodecs",
+    "opencv-python",
+    "atomics",
+]
+
+[tool.setuptools.packages.find]
+include = ["dice_rl*", "diffusion_policy*", "multimodal_representation*", "utils*"]

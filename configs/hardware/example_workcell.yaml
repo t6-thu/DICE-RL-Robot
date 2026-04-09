@@ -1,0 +1,39 @@
+# Example hardware workcell configuration
+# Copy this file and fill in values for your setup.
+
+robot:
+  type: ur5e  # TODO: SET robot type (ur5e, xarm7, etc.)
+  ip: "192.168.1.100"  # TODO: SET robot IP address
+  control_frequency_hz: 500
+  rtde_frequency_hz: 500
+
+gripper:
+  type: wsg50  # TODO: SET gripper type
+  ip: "192.168.1.101"  # TODO: SET gripper IP address
+  port: 1000  # TODO: SET gripper port
+
+cameras:
+  wrist_camera:
+    type: realsense  # TODO: SET camera type
+    serial_number: "000000000000"  # TODO: SET camera serial number
+    resolution: [640, 480]
+    fps: 30
+  external_camera:
+    type: elgato  # TODO: SET camera type
+    device_path: "/dev/video0"  # TODO: SET device path
+    resolution: [640, 480]
+    fps: 30
+
+force_torque_sensor:
+  type: ati_gamma  # TODO: SET F/T sensor type
+  ip: "192.168.1.102"  # TODO: SET F/T sensor IP
+  calibration_file: null  # TODO: SET calibration file path
+
+workspace:
+  # Task-space bounds (meters)
+  x_min: 0.3
+  x_max: 0.7
+  y_min: -0.3
+  y_max: 0.3
+  z_min: 0.0
+  z_max: 0.5

@@ -1,0 +1,22 @@
+# Task configuration: Gear Insertion
+# This config specifies task-specific parameters for RL finetuning.
+
+task:
+  name: gear_insertion
+  description: "Insert a gear into a shaft with tight tolerance"
+
+  # Reset pose (pose7: x, y, z, qx, qy, qz, qw)
+  reset_pose: [0.0636, 0.4381, 0.5641, 0.0057, 0.9999, -0.0012, 0.0082]
+
+  # Control parameters
+  control:
+    translational_stiffness: [1500, 1500, 1500]
+    rotational_stiffness: 100
+    sparse_execution_horizon: 16
+    slow_down_factor: 1
+    max_duration_s: 1620
+
+  # Reward function parameters
+  reward:
+    success_threshold_m: 0.002  # Position error for success
+    force_penalty_weight: 0.0

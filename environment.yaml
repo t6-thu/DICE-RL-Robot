@@ -1,0 +1,49 @@
+name: dice-rl-robot
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - huggingface_hub
+  - wandb
+  - timm
+  - diffusers
+  - accelerate
+  - threadpoolctl
+  - plotly
+  - dill
+  - einops
+  - hydra-core
+  - ipykernel
+  - ipython
+  - matplotlib
+  - omegaconf
+  - opencv
+  - pandas
+  - pyyaml
+  - scipy
+  - tqdm
+  - zarr=2.18
+  - spatialmath-python
+  - numcodecs
+  - scikit-video
+  - imageio-ffmpeg
+  - nbformat
+  - cvxpy
+  # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
+  - llvm-openmp=14
+  # For hardware_interfaces build (robot PC only)
+  # - eigen=3.4
+  # - cmake
+  # - pybind11
+  # - boost
+  # - fmt
+  # - spdlog
+  - pip:
+    - robotmq
+    - atomics
