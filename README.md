@@ -42,7 +42,7 @@ Two-process architecture communicating via [RobotMQ](https://pypi.org/project/ro
 ### 1. Clone the repository
 
 ```bash
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules git@github.com:zhanyisun/DICE-RL-Robot.git
 cd DICE-RL-Robot
 ```
 
