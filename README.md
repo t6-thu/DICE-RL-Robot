@@ -22,8 +22,6 @@ Two-process architecture communicating via [RobotMQ](https://pypi.org/project/ro
 - **Learner** (GPU server): Receives episode metadata from the env runner, loads raw episode data from disk, processes it into a hybrid replay buffer (mixing online episodes with offline expert demonstrations via RLPD), trains a residual RL actor and critic ensemble, and sends updated actor weights back.
 - **Env Runner** (Robot PC): Loads the pretrained BC policy (diffusion policy), runs it on the real robot to collect episodes (RGB, proprioception, wrench), saves raw data to disk, sends episode metadata to the learner via ZMQ, and applies updated actor weights when received.
 
-See [docs/architecture.md](docs/architecture.md) for the full component breakdown.
-
 ---
 
 ## Table of Contents
@@ -393,13 +391,10 @@ DICE-RL-Robot/
 │   └── tasks/                      #   Task-specific parameters
 │
 ├── scripts/                         # Shell and data processing scripts
-│   ├── process_raw_data.py          #   Raw episodes -> zarr conversion
-│   ├── run_learner.sh
-│   └── run_env_runner.sh
-│
-└── docs/                            # Documentation
-    ├── architecture.md
-    └── getting_started.md
+    ├── process_raw_data.py          #   Raw episodes -> zarr conversion
+    ├── run_learner.sh
+    └── run_env_runner.sh
+
 ```
 
 ---
