@@ -28,3 +28,5 @@ Thumbs.db
 .env
 *.log
 wandb/
+
+hardware_interfaces/
