@@ -41,7 +41,11 @@ control_para = {
 
 # Hardware parameters
 hardware_para = {
-    "hardware_config_path": hardware_config_folder_path + "/belt_assembly.yaml",
+    "hardware_config_path": hardware_config_folder_path + "/yam_workstation.yaml",
+    # Which env_runner backend to use. "manip_server" -> original C++ ManipServer
+    # (UR/ARX/ATI/etc); "yam" -> i2rt-backed YamServerEnv (the path expected on
+    # this workstation).
+    "backend": "yam",
 }
 
 # Model parameters (passed to DistillResidualRLImgModel)

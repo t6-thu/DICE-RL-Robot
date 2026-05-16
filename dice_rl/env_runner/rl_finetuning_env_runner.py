@@ -21,7 +21,17 @@ import numpy as np
 import torch
 import zarr
 
-from dice_rl.env_runner.manip_server_handle_env import ManipServerHandleEnv
+def _make_env(backend, **kwargs):
+    """Construct the env-runner backend.
+
+    backend == "manip_server": original C++ ManipServer (UR/ARX/etc).
+    backend == "yam":          i2rt-backed YamServerHandleEnv (single YAM arm).
+    """
+    if backend == "yam":
+        from dice_rl.env_runner.yam_server_handle_env import YamServerHandleEnv
+        return YamServerHandleEnv(**kwargs)
+    from dice_rl.env_runner.manip_server_handle_env import ManipServerHandleEnv
+    return ManipServerHandleEnv(**kwargs)
 from dice_rl.env_runner.env_utils import (
     ts_to_js_traj,
     pose9g1_to_traj,
@@ -40,15 +50,19 @@ from dice_rl.model.distill_rl import DistilledActor
 
 
 def print_env_status(env):
-    """Print current environment sensor status."""
+    """Print current environment sensor status (skips wrench when absent)."""
     obs_raw = env.get_observation_from_buffer()
     for id in env.id_list:
-        robot_wrench = obs_raw[f"robot_wrench_{id}"]
-        ati_wrench = obs_raw[f"wrench_{id}"]
-        robot_wrench_average = np.mean(robot_wrench, axis=0)
-        ati_wrench_average = np.mean(ati_wrench, axis=0)
-        print(f"[Env Status] robot_wrench_{id} average: ", robot_wrench_average)
-        print(f"[Env Status] ati_wrench_{id} average: ", ati_wrench_average)
+        if f"robot_wrench_{id}" in obs_raw:
+            print(
+                f"[Env Status] robot_wrench_{id} average: ",
+                np.mean(obs_raw[f"robot_wrench_{id}"], axis=0),
+            )
+        if f"wrench_{id}" in obs_raw:
+            print(
+                f"[Env Status] ati_wrench_{id} average: ",
+                np.mean(obs_raw[f"wrench_{id}"], axis=0),
+            )
 
 
 class RLFinetuningEnvRunner:
@@ -69,6 +83,8 @@ class RLFinetuningEnvRunner:
         device: str = "cuda",
         # Hardware config
         hardware_config_path: str = None,
+        # "manip_server" (C++ ManipServer) or "yam" (i2rt YamServerEnv).
+        backend: str = "manip_server",
         # Control config
         raw_time_step_s: float = 0.002,
         slow_down_factor: float = 1.0,
@@ -178,8 +194,10 @@ class RLFinetuningEnvRunner:
         self._setup_stiffness_matrix()
 
         # Initialize environment
-        print("[Env Runner] Initializing environment...")
-        self.env = ManipServerHandleEnv(
+        print(f"[Env Runner] Initializing environment (backend={backend})...")
+        self.backend = backend
+        self.env = _make_env(
+            backend,
             camera_res_hw=(self.image_height, self.image_width),
             hardware_config_path=hardware_config_path,
             query_sizes=self.query_sizes,
@@ -604,11 +622,20 @@ class RLFinetuningEnvRunner:
             return np.hstack(grippers)
 
     def _check_delay(self, obs_raw) -> bool:
-        """Check if observation delay exceeds tolerance."""
+        """Check if observation delay exceeds tolerance.
+
+        Wrench delay is only checked when a wrench stream is present (YAM has
+        no F/T sensor and reports zero-filled wrench without timestamps).
+        """
         for id in self.id_list:
             dt_rgb = self.env.current_hardware_time_s - obs_raw[f"rgb_time_stamps_{id}"][-1]
             dt_ts_pose = self.env.current_hardware_time_s - obs_raw[f"robot_time_stamps_{id}"][-1]
-            dt_wrench = self.env.current_hardware_time_s - obs_raw[f"wrench_time_stamps_{id}"][-1]
+            wrench_key = f"wrench_time_stamps_{id}"
+            dt_wrench = (
+                self.env.current_hardware_time_s - obs_raw[wrench_key][-1]
+                if wrench_key in obs_raw
+                else 0.0
+            )
 
             if (dt_rgb > self.delay_tolerance_s or
                 dt_ts_pose > self.delay_tolerance_s or
@@ -815,6 +842,7 @@ def main():
         device=control_para.get("device", "cuda"),
         # Hardware
         hardware_config_path=hardware_para["hardware_config_path"],
+        backend=hardware_para.get("backend", "manip_server"),
         # Control
         raw_time_step_s=control_para["raw_time_step_s"],
         slow_down_factor=control_para["slow_down_factor"],

@@ -14,8 +14,11 @@ export DICE_DATASET_FOLDERS=$HOME/data/real_processed
 export DICE_CHECKPOINT_FOLDERS=$HOME/training_outputs
 # Hardware interfaces root.
 export DICE_HARDWARE_INTERFACES_ROOT="$DICE_REPO_ROOT/hardware_interfaces"
-# Hardware configs.
-export DICE_HARDWARE_CONFIG_FOLDERS=$DICE_HARDWARE_INTERFACES_ROOT/workcell/table_top_manip/config
+# Hardware configs. When using the YAM (i2rt) backend, set this to the
+# in-repo configs/hardware directory and point
+# rl_finetuning_config.hardware_para["hardware_config_path"] at
+# configs/hardware/yam_workstation.yaml.
+export DICE_HARDWARE_CONFIG_FOLDERS=$DICE_REPO_ROOT/configs/hardware
 # Logging folder.
 export DICE_CONTROL_LOG_FOLDERS=$HOME/data/control_log
 

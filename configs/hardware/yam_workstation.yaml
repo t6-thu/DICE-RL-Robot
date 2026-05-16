@@ -1,0 +1,40 @@
+# YAM (I2RT) workstation config consumed by dice_rl.env_runner.yam_server_env.YamServerEnv.
+# Set the i2rt backend used to drive the arm and the RealSense camera used for vision.
+#
+# Edit `can_channel`, `camera_serial`, and the gripper as needed for your bench.
+
+# This workstation has 4 CANable adapters with stable names pinned by
+# /etc/udev/rules.d/90-can.rules:
+#   can_follower_l / can_follower_r  - YAM motor side (where the policy commands joints)
+#   can_leader_l   / can_leader_r    - GELLO leader side (passive teleop handle)
+# Policy deployment must point at a *follower* channel. Change to
+# can_follower_l if you want to run on the left arm.
+can_channel: can_follower_r
+
+# One of (case-insensitive): yam_teaching_handle, crank_4310, linear_3507,
+# linear_4310, no_gripper. Match what is physically mounted on the wrist.
+gripper_type: yam_teaching_handle
+
+# MuJoCo site name from yam.xml used for FK / IK. "grasp_site" is the i2rt
+# default end-effector site.
+fk_site: grasp_site
+
+# Wrist-mounted RealSense serial. Detected D405s on this machine:
+#   218622271309 -> wrist cam (active)
+#   218622278369 -> base cam (not used by this single-stream config)
+#   218622274562 -> spare
+camera_serial: "218622271309"
+
+camera_width: 640
+camera_height: 480
+camera_fps: 30
+
+# Robot loop rates. control_hz commands joint positions; state_read_hz fills
+# the pose/joint feedback ring buffers.
+control_hz: 200.0
+state_read_hz: 200.0
+
+# Ring-buffer horizon in seconds. The buffer auto-resizes to at least 4x the
+# query horizon used by the policy, so 5s is comfortably above what
+# rl_finetuning_env_runner.py requests.
+ring_buffer_seconds: 5.0
