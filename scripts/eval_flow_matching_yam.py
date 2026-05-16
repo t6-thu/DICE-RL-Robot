@@ -8,10 +8,11 @@ branch (rlinf/envs/realworld/yam/yam_env.py), namely:
   * Explicit home pose (6 arm joints) via i2rt's `move_joints` slow ramp
   * Two RealSense D405 cameras (alphabetical order: base, then wrist)
 
-Run with the **dice-rl venv**:
+Run with the **DICE-RL-Robot venv** (no separate dice-rl venv needed — we
+just add the dice-rl repo to sys.path so `model.flow_matching.*` imports work):
 
-    /home/bike/Documents/niu/dice-rl/.venv/bin/python \
-        /home/bike/Documents/niu/DICE-RL-Robot/scripts/eval_flow_matching_yam.py \
+    source /home/bike/Documents/niu/DICE-RL-Robot/.venv/bin/activate
+    python /home/bike/Documents/niu/DICE-RL-Robot/scripts/eval_flow_matching_yam.py \
         --config /home/bike/Documents/niu/DICE-RL-Robot/checkpoints/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/2026-05-16_01-07-54_42/.hydra/config.yaml \
         --ckpt   /home/bike/Documents/niu/DICE-RL-Robot/checkpoints/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/2026-05-16_01-07-54_42/checkpoint/state_700.pt \
         --norm   /home/bike/Documents/niu/DICE-RL-Robot/checkpoints/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/data_meta/normalization.npz \
