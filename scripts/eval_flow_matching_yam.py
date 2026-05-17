@@ -93,20 +93,27 @@ class MinMaxNorm:
 # ---------------------------------------------------------------------------
 
 
-class _CameraThread(threading.Thread):
+class _SyncCamera:
+    """Synchronous on-demand RealSense reader. NO background thread.
+
+    This is intentional — RLinf's yam_deploy reads frames synchronously inside
+    `_get_obs` for the same reason (see infer_pi05_realrobot.py comment about
+    GIL starvation of the CAN control thread). Running camera readers in
+    background Python threads starves i2rt's CAN control thread of GIL time
+    and triggers "loss communication" errors.
+    """
+
     def __init__(self, serial: str, width: int, height: int, fps: int, name: str) -> None:
-        super().__init__(daemon=True, name=f"cam-{name}")
         self.serial = serial
         self.width = width
         self.height = height
         self.fps = fps
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._latest: np.ndarray | None = None  # RGB uint8 HxWx3
-        self._t_latest: float = 0.0
+        self.name = name
         self._pipeline = None
+        self._latest: np.ndarray | None = None
+        self._t_latest: float = 0.0
 
-    def _open(self) -> None:
+    def start(self) -> None:
         import pyrealsense2 as rs
 
         pipeline = rs.pipeline()
@@ -114,43 +121,36 @@ class _CameraThread(threading.Thread):
         config.enable_device(self.serial)
         config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         pipeline.start(config)
-        for _ in range(5):
-            pipeline.wait_for_frames()
+        # NOTE: NO warmup-frame drain here. RLinf's YamEnv just calls
+        # pipeline.start(config) and returns immediately. The motor onboard
+        # watchdog triggers at ~50ms of host silence, and 5 sequential
+        # wait_for_frames() calls (~165ms) would block the main thread long
+        # enough that the i2rt control thread can't get its ~7ms ticks in,
+        # tripping motor watchdog -> "loss communication".
         self._pipeline = pipeline
 
-    def run(self) -> None:
-        try:
-            self._open()
-        except Exception as e:
-            log.exception("[%s] open failed: %s", self.name, e)
-            return
-        while not self._stop.is_set():
-            try:
-                frames = self._pipeline.wait_for_frames(timeout_ms=1000)
-                color = frames.get_color_frame()
-                if not color:
-                    continue
-                rgb = np.asanyarray(color.get_data())  # already RGB
-                with self._lock:
-                    self._latest = rgb
-                    self._t_latest = time.monotonic()
-            except Exception as e:
-                log.warning("[%s] frame error: %s", self.name, e)
-                time.sleep(0.05)
-
     def get(self) -> tuple[np.ndarray | None, float]:
-        with self._lock:
-            if self._latest is None:
-                return None, 0.0
+        if self._pipeline is None:
+            return None, 0.0
+        try:
+            frames = self._pipeline.wait_for_frames(timeout_ms=1000)
+            color = frames.get_color_frame()
+            if not color:
+                return self._latest, self._t_latest
+            self._latest = np.asanyarray(color.get_data())
+            self._t_latest = time.monotonic()
             return self._latest.copy(), self._t_latest
+        except Exception as e:
+            log.warning("[%s] frame error: %s", self.name, e)
+            return self._latest, self._t_latest
 
     def stop(self) -> None:
-        self._stop.set()
         if self._pipeline is not None:
             try:
                 self._pipeline.stop()
             except Exception:
                 pass
+            self._pipeline = None
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ class _CameraThread(threading.Thread):
 def load_flow_policy(config_path: str, ckpt_path: str, device: torch.device, use_ema: bool):
     # Hydra config (.hydra/config.yaml) contains ${now:...} interpolations; register a
     # stub resolver so OmegaConf can load it outside a hydra runtime.
-    OmegaConf.register_new_resolver("now", lambda fmt: "n/a", replace=True)
+    OmegaConf.register_new_resolver("now", lambda _fmt: "n/a", replace=True)
     cfg = OmegaConf.load(config_path)
     import hydra
 
@@ -227,6 +227,22 @@ def main() -> None:
     )
     parser.add_argument("--base_serial", required=True)
     parser.add_argument("--wrist_serial", required=True)
+    parser.add_argument("--camera_width", type=int, default=640)
+    parser.add_argument("--camera_height", type=int, default=480)
+    parser.add_argument("--camera_fps", type=int, default=30,
+                        help="Camera capture rate. Drop to 15 or 5 if the wrist camera is "
+                        "sharing a USB 2.0 controller with the CAN dongles -- the lower "
+                        "bandwidth keeps the CAN packets flowing without packet starvation.")
+    parser.add_argument("--no_cameras", action="store_true",
+                        help="DIAGNOSTIC: skip camera open entirely; feed zero-valued images "
+                        "to the policy. The policy output will be wrong (no visual info) but "
+                        "the CAN bus / control thread should behave exactly like the i2rt "
+                        "baseline. Use this to confirm whether cameras are the trigger.")
+    parser.add_argument("--gripper_limits", default=None,
+                        help="For linear_*: 'closed,open' (raw motor angles in rad) so i2rt "
+                        "skips the auto-calibration that destabilizes the CAN bus. We learned "
+                        "the left-arm linear_4310 limits from a prior auto-cal run: "
+                        "1.077,6.316. Pass that string to use linear_4310 + skip calibration.")
     parser.add_argument(
         "--home_joint_pos",
         type=_parse_home,
@@ -245,7 +261,18 @@ def main() -> None:
         "--control_hz", type=float, default=30.0,
         help="Action frequency (Hz). Default matches LeRobot YAM dataset fps.",
     )
-    parser.add_argument("--ramp_seconds", type=float, default=3.0)
+    parser.add_argument("--ramp_seconds", type=float, default=8.0,
+                        help="Time (s) for the auto-home move. Longer = gentler current draw "
+                        "= less bus stress. Default 8s is conservative.")
+    parser.add_argument("--skip_home", action="store_true",
+                        help="Skip the automatic move_joints(home, ...) at episode start. "
+                        "Use this when you've already manually placed the arm at home pose "
+                        "(e.g. by back-driving it under gravity_comp mode). Avoids the "
+                        "current spike that can destabilize CAN if home is far from current pose.")
+    parser.add_argument("--max_home_distance", type=float, default=0.5,
+                        help="If any single joint must move farther than this (rad) to reach "
+                        "home, refuse to auto-home (suggest manual placement first). "
+                        "Override with a larger value if you trust your bus.")
     parser.add_argument("--num_episodes", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=600)
     parser.add_argument(
@@ -274,7 +301,69 @@ def main() -> None:
         help="Load checkpoint['model'] instead of checkpoint['ema']. The dice-rl repo "
         "defaults to EMA for SL-trained policies; only override if you know better.",
     )
+    parser.add_argument(
+        "--check_cameras_only",
+        action="store_true",
+        help="Just open both cameras, save labeled snapshots to /tmp, and exit. "
+        "Use this to visually verify base vs wrist serial assignment before running eval.",
+    )
+    parser.add_argument(
+        "--no_prompt",
+        action="store_true",
+        help="Skip the 'Press Enter to start' interactive prompt. Useful for non-interactive runs.",
+    )
     args = parser.parse_args()
+
+    # ---- Camera-only sanity check ----
+    if args.check_cameras_only:
+        base_cam = _SyncCamera(args.base_serial, args.camera_width, args.camera_height, args.camera_fps, "base")
+        wrist_cam = _SyncCamera(args.wrist_serial, args.camera_width, args.camera_height, args.camera_fps, "wrist")
+        base_cam.start()
+        wrist_cam.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if base_cam.get()[0] is not None and wrist_cam.get()[0] is not None:
+                break
+            time.sleep(0.05)
+        base_rgb, _ = base_cam.get()
+        wrist_rgb, _ = wrist_cam.get()
+        if base_rgb is None or wrist_rgb is None:
+            log.error("camera open failed")
+            base_cam.stop(); wrist_cam.stop()
+            sys.exit(1)
+        # Convert RGB -> BGR for cv2 imwrite, and add a label.
+        def _annotate(rgb, label, serial):
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            cv2.putText(bgr, label, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(bgr, f"serial {serial}",
+                        (12, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+            return bgr
+        base_anno = _annotate(base_rgb, "BASE", args.base_serial)
+        wrist_anno = _annotate(wrist_rgb, "WRIST", args.wrist_serial)
+        # Side-by-side, padded to equal height.
+        h = max(base_anno.shape[0], wrist_anno.shape[0])
+        def _pad(img):
+            if img.shape[0] < h:
+                pad = np.zeros((h - img.shape[0], img.shape[1], 3), dtype=img.dtype)
+                return np.vstack([img, pad])
+            return img
+        side = np.hstack([_pad(base_anno), _pad(wrist_anno)])
+        out_combined = "/tmp/yam_camera_check.jpg"
+        out_base = "/tmp/yam_camera_base.jpg"
+        out_wrist = "/tmp/yam_camera_wrist.jpg"
+        cv2.imwrite(out_combined, side)
+        cv2.imwrite(out_base, base_anno)
+        cv2.imwrite(out_wrist, wrist_anno)
+        log.info("camera check images saved:")
+        log.info("  combined side-by-side : %s", out_combined)
+        log.info("  base only             : %s", out_base)
+        log.info("  wrist only            : %s", out_wrist)
+        log.info("Open with: xdg-open %s   (or eog/feh/your viewer)", out_combined)
+        base_cam.stop()
+        wrist_cam.stop()
+        sys.exit(0)
+    # ---- end camera-only mode ----
 
     device = torch.device(args.device)
     log.info("device=%s  dry_run=%s  command_gripper=%s", device, args.dry_run, args.command_gripper)
@@ -294,6 +383,25 @@ def main() -> None:
     )
     log.info("state range: lo=%s\n             hi=%s", state_norm.lo, state_norm.hi)
 
+    # --- model warmup BEFORE touching the robot ---
+    # Mirrors RLinf's `infer_pi05_realrobot.py` which loads + warms the model
+    # before opening the robot. Without this, the FIRST inference inside the
+    # eval loop takes ~300ms (kernel compile) and holds the GIL the whole time,
+    # starving i2rt's CAN control thread of GIL access and triggering
+    # "motor X loss communication". After warmup, inferences run ~30ms.
+    log.info("warming up policy on GPU (this is what RLinf does to avoid GIL "
+             "starvation of the CAN control thread later)...")
+    _warm_t0 = time.monotonic()
+    with torch.no_grad():
+        dummy_state = torch.zeros(1, cond_steps, int(cfg.obs_dim), device=device)
+        dummy_rgb = torch.zeros(1, img_cond_steps, 6, 128, 128, dtype=torch.float32, device=device)
+        # Two passes — first compiles kernels, second is the true steady-state time.
+        for i in range(2):
+            _ = model(cond={"state": dummy_state, "rgb": dummy_rgb}, deterministic=True)
+            torch.cuda.synchronize() if device.type == "cuda" else None
+    log.info("warmup done in %.0fms (first inference now ~30ms)",
+             (time.monotonic() - _warm_t0) * 1000)
+
     # --- connect hardware ---
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import GripperType
@@ -307,28 +415,81 @@ def main() -> None:
         gripper_type=gripper_type,
         zero_gravity_mode=True,
     )
+    # NOTE: MotorChainRobot.__init__ already spins up `_server_thread` that
+    # drives the control loop, so we MUST NOT call start_server() again here;
+    # a second loop fights the first one on the bus and triggers
+    # "Motor error detected: ... loss communication".
 
-    base_cam = _CameraThread(args.base_serial, 640, 480, 30, "base")
-    wrist_cam = _CameraThread(args.wrist_serial, 640, 480, 30, "wrist")
-    base_cam.start()
-    wrist_cam.start()
+    # Fail-fast guard: gripper auto-calibration can crash the control thread
+    # (motor X "loss communication") on a flaky CAN bus. If that thread is
+    # dead, every command_joint_pos call below silently no-ops, producing a
+    # misleadingly clean log. We poll for 10 s and abort if it dies.
+    server_thread = getattr(robot, "_server_thread", None)
 
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if base_cam.get()[0] is not None and wrist_cam.get()[0] is not None:
-            break
-        time.sleep(0.05)
-    if base_cam.get()[0] is None or wrist_cam.get()[0] is None:
-        log.error("cameras did not produce frames within 5 s")
-        sys.exit(1)
-    log.info("both cameras streaming.")
+    def _assert_control_alive(context: str) -> None:
+        if server_thread is not None and not server_thread.is_alive():
+            log.error(
+                "[%s] i2rt robot_server thread is NOT alive. The control loop crashed "
+                "(typically CAN comm loss during gripper auto-calibration). Commands "
+                "would silently no-op. Recommended fixes:\n"
+                "  1) sudo ip link set %s down && sudo ip link set %s up type can bitrate 1000000  (CAN reset)\n"
+                "  2) Try --gripper_type yam_teaching_handle to skip auto-calibration\n"
+                "  3) Try the other follower CAN channel",
+                context, args.can_channel, args.can_channel,
+            )
+            try:
+                base_cam.stop(); wrist_cam.stop()
+                robot.close()
+            except Exception:
+                pass
+            sys.exit(2)
+
+    # Match RLinf yam_env.py exactly: open cameras IMMEDIATELY after robot
+    # init. NO command, NO sleep, NO fail-fast wait. i2rt's default state is
+    # zero-torque + gravity-comp; the arm just hangs there. Issuing any
+    # command (including a "hold current pose") flips kp from 0 to 80 in one
+    # step, which on a stale state read can produce a torque spike strong
+    # enough to delay a CAN tick and trip the motor watchdog.
+    _assert_control_alive("post-init")
+
+    if args.no_cameras:
+        log.warning("--no_cameras: feeding zero images to policy; CAN traffic is the only "
+                    "USB load. Policy output will be wrong but CAN should match i2rt baseline.")
+        # Use a sentinel object that mimics _SyncCamera's `get()` API.
+        class _ZeroCam:
+            def __init__(self, h, w):
+                self._frame = np.zeros((h, w, 3), dtype=np.uint8)
+            def start(self): pass
+            def stop(self): pass
+            def get(self): return self._frame.copy(), time.monotonic()
+        base_cam = _ZeroCam(args.camera_height, args.camera_width)
+        wrist_cam = _ZeroCam(args.camera_height, args.camera_width)
+    else:
+        base_cam = _SyncCamera(args.base_serial, args.camera_width, args.camera_height, args.camera_fps, "base")
+        wrist_cam = _SyncCamera(args.wrist_serial, args.camera_width, args.camera_height, args.camera_fps, "wrist")
+        base_cam.start()
+        wrist_cam.start()
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if base_cam.get()[0] is not None and wrist_cam.get()[0] is not None:
+                break
+            time.sleep(0.05)
+        if base_cam.get()[0] is None or wrist_cam.get()[0] is None:
+            log.error("cameras did not produce frames within 5 s")
+            sys.exit(1)
+        log.info("both cameras streaming.")
 
     def safe_shutdown(*_):
-        log.info("shutting down: holding current pose, stopping threads")
-        try:
-            robot.command_joint_pos(robot.get_joint_pos())
-        except Exception:
-            pass
+        log.info("shutting down: stopping threads")
+        # In dry_run mode the control loop hasn't been actively driving the
+        # robot, so sending a hold command on the way out tends to wake the
+        # control loop late and trigger "loss communication" log spam.
+        if not args.dry_run:
+            try:
+                robot.command_joint_pos(robot.get_joint_pos())
+            except Exception:
+                pass
         base_cam.stop()
         wrist_cam.stop()
         sys.exit(0)
@@ -341,24 +502,50 @@ def main() -> None:
     img_hist: deque = deque(maxlen=img_cond_steps)
     period = 1.0 / args.control_hz
 
+    # Define state-reader once, before any per-episode use.
+    def _read_state() -> np.ndarray:
+        obs = robot.get_observations()
+        joint = np.asarray(obs["joint_pos"], dtype=np.float32)        # (6,)
+        grip = np.asarray(obs.get("gripper_pos", [args.home_gripper_pos]),
+                          dtype=np.float32).reshape(-1)               # (1,)
+        return np.concatenate([joint[:6], grip[:1]])                  # (7,)
+
     for ep in range(args.num_episodes):
         log.info("=== episode %d ===", ep + 1)
 
         # Move to home (arm + gripper) - matches data-collection start pose.
         home_full = np.concatenate([args.home_joint_pos, [args.home_gripper_pos]]).astype(np.float32)
-        log.info("moving to home: arm=%s gripper=%.3f (ramp=%.1fs)",
-                 args.home_joint_pos.tolist(), args.home_gripper_pos, args.ramp_seconds)
-        if not args.dry_run:
-            robot.move_joints(home_full, time_interval_s=args.ramp_seconds)
-            time.sleep(0.5)
 
-        # Read full state after home so history starts from a sane pose.
-        def _read_state() -> np.ndarray:
-            obs = robot.get_observations()
-            joint = np.asarray(obs["joint_pos"], dtype=np.float32)        # (6,)
-            grip = np.asarray(obs.get("gripper_pos", [args.home_gripper_pos]),
-                              dtype=np.float32).reshape(-1)               # (1,)
-            return np.concatenate([joint[:6], grip[:1]])                  # (7,)
+        if args.skip_home:
+            log.info("--skip_home set: leaving arm wherever you put it.")
+            q_now_arm = _read_state()[:6]
+            far = np.max(np.abs(q_now_arm - args.home_joint_pos))
+            log.info("current arm vs target home: max |delta|=%.3f rad", far)
+        else:
+            q_now_arm = _read_state()[:6]
+            far = np.max(np.abs(q_now_arm - args.home_joint_pos))
+            log.info("moving to home: arm=%s gripper=%.3f (ramp=%.1fs, max |delta|=%.3f rad)",
+                     args.home_joint_pos.tolist(), args.home_gripper_pos, args.ramp_seconds, far)
+            if far > args.max_home_distance:
+                log.error(
+                    "Refusing to auto-home: max joint delta %.3f rad > --max_home_distance %.3f. "
+                    "Manually back-drive the arm closer to the home pose (use gravity_comp mode "
+                    "via `python /home/bike/Documents/niu/i2rt/i2rt/robots/motor_chain_robot.py "
+                    "--channel %s --gripper_type crank_4310 --operation_mode gravity_comp`), "
+                    "or re-run with --skip_home if you've already done so.",
+                    far, args.max_home_distance, args.can_channel,
+                )
+                base_cam.stop(); wrist_cam.stop()
+                try:
+                    robot.close()
+                except Exception:
+                    pass
+                sys.exit(3)
+            _assert_control_alive("pre-home-move")
+            if not args.dry_run:
+                robot.move_joints(home_full, time_interval_s=args.ramp_seconds)
+                time.sleep(0.5)
+            _assert_control_alive("post-home-move")
 
         # Pre-fill history.
         q = _read_state()
@@ -384,7 +571,10 @@ def main() -> None:
         else:
             log.info("home state is inside BC training range.")
 
-        input("Press Enter to start the eval loop (Ctrl-C to abort).")
+        if args.no_prompt:
+            log.info("--no_prompt set; starting eval loop immediately.")
+        else:
+            input("Press Enter to start the eval loop (Ctrl-C to abort).")
 
         for step in range(args.max_steps):
             tick = time.monotonic()
