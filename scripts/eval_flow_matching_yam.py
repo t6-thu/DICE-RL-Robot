@@ -273,17 +273,48 @@ def main() -> None:
                         help="If any single joint must move farther than this (rad) to reach "
                         "home, refuse to auto-home (suggest manual placement first). "
                         "Override with a larger value if you trust your bus.")
-    parser.add_argument("--num_episodes", type=int, default=1)
+    parser.add_argument(
+        "--num_episodes", type=int, default=999,
+        help="Cap on the number of episodes per launch. Between episodes the "
+        "arm ramps back to home and (without --no_prompt) the script prompts "
+        "you to press Enter for the next try or 'q' to quit. Default 999 = "
+        "effectively unlimited; use 1 if you want a one-shot run.",
+    )
     parser.add_argument("--max_steps", type=int, default=600)
     parser.add_argument(
-        "--max_joint_delta", type=float, default=0.08,
-        help="Per-tick max joint delta in rad (arm only). At 30 Hz, 0.08 rad ≈ 2.4 rad/s.",
+        "--max_joint_delta", type=float, default=0.5,
+        help="Per-tick max joint delta in rad (arm only). Acts as a safety cap, not a "
+        "smoothing filter. At 30 Hz, 0.5 rad ≈ 15 rad/s — well above typical BC policy "
+        "outputs. Setting this too low (e.g. 0.08) staircase-clips smooth policy chunks "
+        "and causes visible shake. Use 0.5 to let the policy drive smoothly; lower it "
+        "only if you see runaway motion.",
+    )
+    parser.add_argument(
+        "--reset_on_exit",
+        action="store_true",
+        default=True,
+        help="On episode end or Ctrl-C, slowly ramp the arm back to --home_joint_pos so "
+        "the next run starts from a clean state. Uses i2rt's move_joints (50-step "
+        "interpolated). Disable with --no-reset_on_exit.",
+    )
+    parser.add_argument(
+        "--no-reset_on_exit", dest="reset_on_exit", action="store_false",
+    )
+    parser.add_argument(
+        "--reset_seconds", type=float, default=4.0,
+        help="Duration of the reset-on-exit ramp.",
     )
     parser.add_argument(
         "--command_gripper",
         action="store_true",
-        help="Send commands to the 7th channel (gripper). Default OFF; turn ON only when an "
-        "active gripper is mounted and you're sure the policy's gripper output is sane.",
+        default=True,
+        help="Send the policy's gripper output (action[6]) to the 7th motor (linear_4310 etc). "
+        "Default ON. The offline replay confirmed gripper predictions match training data "
+        "with MAE ~0.10. Without this, the arm approaches the object but never closes. "
+        "Disable only if you mount a passive teaching handle.",
+    )
+    parser.add_argument(
+        "--no-command_gripper", dest="command_gripper", action="store_false",
     )
     parser.add_argument(
         "--dry_run",
@@ -480,22 +511,50 @@ def main() -> None:
             sys.exit(1)
         log.info("both cameras streaming.")
 
-    def safe_shutdown(*_):
-        log.info("shutting down: stopping threads")
-        # In dry_run mode the control loop hasn't been actively driving the
-        # robot, so sending a hold command on the way out tends to wake the
-        # control loop late and trigger "loss communication" log spam.
-        if not args.dry_run:
+    # SIGINT semantics:
+    #   1st Ctrl-C while an episode is running -> stop current episode, reset
+    #     to home, then prompt for the next episode (NOT exit the script).
+    #   2nd Ctrl-C (while idle at the prompt, or another Ctrl-C inside the
+    #     current cleanup) -> hard quit.
+    _abort_episode = {"flag": False}
+    _force_quit = {"flag": False}
+
+    def _ramp_to_home() -> None:
+        if args.dry_run or not args.reset_on_exit:
+            return
+        try:
+            home_arm = np.asarray(args.home_joint_pos, dtype=np.float64)
+            current = robot.get_joint_pos().astype(np.float64)
+            home_full = np.concatenate([home_arm, [current[6]]])
+            log.info("resetting to home pose over %.1fs ...", args.reset_seconds)
+            robot.move_joints(home_full, time_interval_s=args.reset_seconds)
+            log.info("at home.")
+        except Exception as e:
+            log.warning("reset_to_home failed: %s", e)
+
+    def _final_shutdown() -> None:
+        log.info("shutting down camera pipelines...")
+        try:
+            base_cam.stop()
+            wrist_cam.stop()
+        except Exception:
+            pass
+
+    def handle_sigint(*_):
+        if _abort_episode["flag"]:
+            # Already aborting; this is a 2nd Ctrl-C -> hard quit.
+            log.warning("force quit (Ctrl-C twice)")
+            _force_quit["flag"] = True
             try:
-                robot.command_joint_pos(robot.get_joint_pos())
+                _final_shutdown()
             except Exception:
                 pass
-        base_cam.stop()
-        wrist_cam.stop()
-        sys.exit(0)
+            os._exit(130)
+        log.info("Ctrl-C received: ending current episode, will reset to home.")
+        _abort_episode["flag"] = True
 
-    signal.signal(signal.SIGINT, safe_shutdown)
-    signal.signal(signal.SIGTERM, safe_shutdown)
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
 
     # --- per-episode loop ---
     state_hist: deque = deque(maxlen=cond_steps)
@@ -576,8 +635,17 @@ def main() -> None:
         else:
             input("Press Enter to start the eval loop (Ctrl-C to abort).")
 
+        _abort_episode["flag"] = False  # reset for this episode
+
         for step in range(args.max_steps):
-            tick = time.monotonic()
+            if _abort_episode["flag"]:
+                break
+            # NOTE: do NOT capture `tick` here. Camera reads (~66ms) + inference
+            # (~30ms) take ~100ms, and if we paced the inner action loop from
+            # this early tick, the first 3 actions would fire instantly trying
+            # to "catch up", producing a visible snap before the chunk settles
+            # into 33ms cadence. We capture chunk_start_t AFTER inference so
+            # all 8 actions in the chunk are spaced uniformly at 1/control_hz.
 
             # Sample the latest sensor data.
             q_now = _read_state()
@@ -614,10 +682,19 @@ def main() -> None:
                 log.info("[ep %d step %d] infer=%.1fms  q_now=%s",
                          ep+1, step, infer_ms, np.round(q_now, 3).tolist())
 
-            # Execute first act_steps actions at control_hz.
+            # Execute first act_steps actions at control_hz, paced from RIGHT
+            # NOW (after inference) so the chunk doesn't open with a snap.
             chunk = actions[:act_steps]
+            chunk_start_t = time.monotonic()
             for i, q_target in enumerate(chunk):
-                target_tick = tick + i * period
+                if _abort_episode["flag"]:
+                    break
+                target_send_t = chunk_start_t + i * period
+                # Wait until this command's intended send time. If we're early,
+                # sleep; if we're behind, send immediately (no catch-up rush).
+                now = time.monotonic()
+                if now < target_send_t:
+                    time.sleep(target_send_t - now)
 
                 q_cur = _read_state()
                 delta = q_target - q_cur
@@ -632,15 +709,40 @@ def main() -> None:
 
                 if not args.dry_run:
                     robot.command_joint_pos(q_cmd)
+                # Pacing is enforced at the TOP of next iteration via
+                # target_send_t. Don't sleep here -- that would double-count.
 
-                # Maintain control rate.
-                sleep = target_tick + period - time.monotonic()
-                if sleep > 0:
-                    time.sleep(sleep)
+        # ---- end of episode ----
+        if _abort_episode["flag"]:
+            log.info("episode %d aborted by user (Ctrl-C).", ep + 1)
+        else:
+            log.info("episode %d finished (max_steps=%d).", ep + 1, args.max_steps)
 
-        log.info("episode %d finished (max_steps=%d)", ep + 1, args.max_steps)
+        # Ramp back to home so the next episode starts from a clean pose.
+        _ramp_to_home()
 
-    safe_shutdown()
+        # Decide whether to prompt before the next episode.
+        #   - After Ctrl-C (`_abort_episode` true): ALWAYS prompt, even with
+        #     --no_prompt. Rationale: Ctrl-C is a deliberate human intervention;
+        #     the operator wants to reposition / inspect / decide before retry.
+        #   - After natural max_steps end: respect --no_prompt.
+        is_last = (ep + 1 >= args.num_episodes)
+        aborted = _abort_episode["flag"]
+        should_prompt = not is_last and (aborted or not args.no_prompt)
+        if should_prompt:
+            tag = "ABORTED by Ctrl-C" if aborted else "done"
+            try:
+                ans = input(
+                    f"Episode {ep + 1}/{args.num_episodes} {tag}. "
+                    "Press Enter to start next trial, q+Enter to quit: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "q"
+            if ans == "q":
+                log.info("user requested quit.")
+                break
+
+    _final_shutdown()
 
 
 if __name__ == "__main__":
