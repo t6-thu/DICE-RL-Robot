@@ -30,11 +30,13 @@ Policy I/O contract (deduced from dice-rl source):
                  (action_min == obs_min in the dataset).
   * exec_steps : 8 actions per chunk (cfg.act_steps).
 
-Safety knobs:
-  * --dry_run            : runs perception+inference but does NOT command the robot.
-  * --max_joint_delta    : per-tick joint motion clamp (rad).
-  * --command_gripper    : default OFF when teaching handle is mounted; turn ON for
-                            an active gripper (e.g. linear_4310).
+Safety knobs (intentionally MINIMAL — we send the policy's output verbatim
+otherwise, since per-tick delta clamps were found to staircase-clip smooth
+chunks and disrupt the BC trajectory):
+  * --dry_run            : runs perception + inference but does NOT command the robot.
+  * --command_gripper    : default ON; disable only when a passive teaching
+                            handle is mounted (use --no-command_gripper).
+  * joint range clamp    : hardware-mandated (built into the script, not a flag).
 """
 
 from __future__ import annotations
@@ -121,28 +123,39 @@ class _SyncCamera:
         config.enable_device(self.serial)
         config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         pipeline.start(config)
-        # NOTE: NO warmup-frame drain here. RLinf's YamEnv just calls
-        # pipeline.start(config) and returns immediately. The motor onboard
-        # watchdog triggers at ~50ms of host silence, and 5 sequential
-        # wait_for_frames() calls (~165ms) would block the main thread long
-        # enough that the i2rt control thread can't get its ~7ms ticks in,
-        # tripping motor watchdog -> "loss communication".
+        # One blocking wait to bootstrap the cache. After this, get() polls
+        # non-blocking so the 30Hz inner action loop stays on its 33ms budget.
+        try:
+            frames = pipeline.wait_for_frames(timeout_ms=2000)
+            color = frames.get_color_frame()
+            if color:
+                self._latest = np.asanyarray(color.get_data())
+                self._t_latest = time.monotonic()
+        except Exception as e:
+            log.warning("[%s] bootstrap frame error: %s", self.name, e)
         self._pipeline = pipeline
 
     def get(self) -> tuple[np.ndarray | None, float]:
+        """Non-blocking poll. Always returns IMMEDIATELY with the freshest
+        cached frame (up to ~33ms stale, matching training's 30Hz sampling).
+        This is the key trick to keep the inner action loop on a true 30Hz
+        budget: blocking wait_for_frames would otherwise add ~33ms per camera
+        per tick, halving the effective control rate.
+        """
         if self._pipeline is None:
             return None, 0.0
         try:
-            frames = self._pipeline.wait_for_frames(timeout_ms=1000)
-            color = frames.get_color_frame()
-            if not color:
-                return self._latest, self._t_latest
-            self._latest = np.asanyarray(color.get_data())
-            self._t_latest = time.monotonic()
-            return self._latest.copy(), self._t_latest
+            new_frames = self._pipeline.poll_for_frames()
+            if new_frames:
+                color = new_frames.get_color_frame()
+                if color:
+                    self._latest = np.asanyarray(color.get_data())
+                    self._t_latest = time.monotonic()
         except Exception as e:
-            log.warning("[%s] frame error: %s", self.name, e)
-            return self._latest, self._t_latest
+            log.warning("[%s] poll error: %s", self.name, e)
+        if self._latest is None:
+            return None, 0.0
+        return self._latest, self._t_latest
 
     def stop(self) -> None:
         if self._pipeline is not None:
@@ -188,15 +201,60 @@ def load_flow_policy(config_path: str, ckpt_path: str, device: torch.device, use
 
 
 # ---------------------------------------------------------------------------
-# Image preprocessing: bilinear resize to 128x128, uint8 RGB
-# (dice-rl/script/dataset/process_yam_dataset.py uses cv2.resize, no center crop)
+# Image preprocessing: must EXACTLY match the training-side pipeline.
+#
+# Training videos at /mnt/.../picknplace_paperplate_arizonabottle were produced
+# by two stacked steps:
+#
+#   (1) convert_yam_to_lerobot_rlinf.py:resize_short_side_and_center_crop
+#       camera_native (e.g. 640x480) ->
+#       scale so shorter side reaches 256 (preserves aspect) ->
+#       center-crop to 256x256 (drops the excess on the long side) ->
+#       saved into LeRobot as 256x256 RGB videos.
+#
+#   (2) dice-rl/script/dataset/process_yam_dataset.py:_resize_rgb
+#       256x256 ->
+#       torch.nn.functional.interpolate(size=(128,128), mode="bilinear",
+#                                       align_corners=False) ->
+#       stored in train.npz as 128x128 uint8.
+#
+# An earlier eval pipeline went straight from 640x480 to 128x128, which (a)
+# squashed the 4:3 aspect into 1:1, distorting the scene, and (b) used a
+# different downsampler. Either alone is enough to push the visual feature
+# off the BC training distribution and disable the grasp transition.
 # ---------------------------------------------------------------------------
 
 
+def _resize_short_side_and_center_crop(rgb: np.ndarray, target: int = 256) -> np.ndarray:
+    """Mirror of resize_short_side_and_center_crop from convert_yam_to_lerobot_rlinf.py.
+
+    rgb: (H, W, 3) uint8 RGB -> (target, target, 3) uint8 RGB.
+    """
+    h, w = rgb.shape[:2]
+    scale = max(target / w, target / h)
+    new_w = max(target, int(np.ceil(w * scale)))
+    new_h = max(target, int(np.ceil(h * scale)))
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    x0 = (new_w - target) // 2
+    y0 = (new_h - target) // 2
+    return resized[y0:y0 + target, x0:x0 + target]
+
+
 def _resize_to_128(rgb: np.ndarray) -> np.ndarray:
-    """RGB HxWx3 uint8 -> 3x128x128 uint8."""
-    rgb = cv2.resize(rgb, (128, 128), interpolation=cv2.INTER_AREA)
-    return np.transpose(rgb, (2, 0, 1)).astype(np.uint8)  # (3, 128, 128)
+    """Full two-step training preprocessing.
+
+    Input:  RGB (H, W, 3) uint8 at the camera's native resolution (typ. 640x480).
+    Output: (3, 128, 128) uint8 RGB, ready to concat with another camera on
+            the channel axis and feed to the policy.
+    """
+    # Step 1: short-side resize + center-crop -> 256x256 (matches LeRobot storage).
+    rgb_256 = _resize_short_side_and_center_crop(rgb, target=256)
+    # Step 2: torch bilinear -> 128x128 (matches process_yam_dataset.py:_resize_rgb).
+    rgb_t = torch.from_numpy(rgb_256).permute(2, 0, 1).unsqueeze(0).float()
+    rgb_t = torch.nn.functional.interpolate(
+        rgb_t, size=(128, 128), mode="bilinear", align_corners=False
+    )
+    return rgb_t.squeeze(0).clamp(0, 255).to(torch.uint8).numpy()      # (3,128,128)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +311,14 @@ def main() -> None:
     parser.add_argument(
         "--home_gripper_pos",
         type=float,
-        default=0.5,
-        help="Normalized gripper position at home (0=closed, 1=open).",
+        default=1.0,
+        help="Normalized gripper command at home (i2rt command space). Verified "
+        "convention on this machine via test_gripper_direction.py: command=1 -> "
+        "OPEN, command=0 -> CLOSED. Default 1.0 = fully open at home, matching "
+        "the training-data start where state[6] ~= 0.998 (gripper fully open "
+        "before approach). Setting this to 0.5 would have the gripper close "
+        "halfway during the home ramp, which is what the policy interprets as "
+        "'mid-grasp' and likely confuses the visual-state input.",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -282,12 +346,17 @@ def main() -> None:
     )
     parser.add_argument("--max_steps", type=int, default=600)
     parser.add_argument(
-        "--max_joint_delta", type=float, default=0.5,
-        help="Per-tick max joint delta in rad (arm only). Acts as a safety cap, not a "
-        "smoothing filter. At 30 Hz, 0.5 rad ≈ 15 rad/s — well above typical BC policy "
-        "outputs. Setting this too low (e.g. 0.08) staircase-clips smooth policy chunks "
-        "and causes visible shake. Use 0.5 to let the policy drive smoothly; lower it "
-        "only if you see runaway motion.",
+        "--act_steps", type=int, default=None,
+        help="Override cfg.act_steps (= how many actions of the 16-step chunk to execute "
+        "before re-querying). Training default is 8 (264ms open-loop). Smaller values "
+        "(e.g. 4 or 2) close the loop tighter and reduce BC compounding error at the cost "
+        "of more inference per second.",
+    )
+    parser.add_argument(
+        "--noise_seed", type=int, default=None,
+        help="If set, use a FIXED init noise for flow-matching inference (deterministic). "
+        "Without this, every call uses fresh torch.randn -> run-to-run variance even on "
+        "the same observation. Set to any int (e.g. 0) for reproducible behavior.",
     )
     parser.add_argument(
         "--reset_on_exit",
@@ -342,6 +411,14 @@ def main() -> None:
         "--no_prompt",
         action="store_true",
         help="Skip the 'Press Enter to start' interactive prompt. Useful for non-interactive runs.",
+    )
+    parser.add_argument(
+        "--dump_obs_dir",
+        default=None,
+        help="Optional directory. When set, every inference step saves the exact "
+        "128x128 RGB tensor fed into the policy as JPG so you can visually verify "
+        "the camera view matches training. Files: <dir>/step_NNNN_base.jpg and "
+        "<dir>/step_NNNN_wrist.jpg.",
     )
     args = parser.parse_args()
 
@@ -399,6 +476,10 @@ def main() -> None:
     device = torch.device(args.device)
     log.info("device=%s  dry_run=%s  command_gripper=%s", device, args.dry_run, args.command_gripper)
 
+    if args.dump_obs_dir is not None:
+        os.makedirs(args.dump_obs_dir, exist_ok=True)
+        log.info("will dump per-step 128x128 obs JPEGs to %s", args.dump_obs_dir)
+
     # --- policy + normalization ---
     model, cfg = load_flow_policy(args.config, args.ckpt, device, use_ema=not args.no_ema)
     norm_data = np.load(args.norm)
@@ -407,10 +488,17 @@ def main() -> None:
     cond_steps = int(cfg.cond_steps)
     img_cond_steps = int(cfg.img_cond_steps)
     horizon_steps = int(cfg.horizon_steps)
-    act_steps = int(cfg.act_steps)
+    # Allow CLI override of act_steps so we can close the loop tighter at eval
+    # time than the training config used. Smaller act_steps = more frequent
+    # re-querying = less compounding error from open-loop drift, at the cost
+    # of more inference per second.
+    act_steps = args.act_steps if args.act_steps is not None else int(cfg.act_steps)
     log.info(
-        "policy cfg: cond_steps=%d img_cond_steps=%d horizon=%d act_steps=%d flow_steps=%d",
-        cond_steps, img_cond_steps, horizon_steps, act_steps, int(cfg.flow_steps),
+        "policy cfg: cond_steps=%d img_cond_steps=%d horizon=%d act_steps=%d "
+        "(from cfg=%d, %s) flow_steps=%d",
+        cond_steps, img_cond_steps, horizon_steps, act_steps, int(cfg.act_steps),
+        "CLI override" if args.act_steps is not None else "no override",
+        int(cfg.flow_steps),
     )
     log.info("state range: lo=%s\n             hi=%s", state_norm.lo, state_norm.hi)
 
@@ -647,15 +735,32 @@ def main() -> None:
             # into 33ms cadence. We capture chunk_start_t AFTER inference so
             # all 8 actions in the chunk are spaced uniformly at 1/control_hz.
 
-            # Sample the latest sensor data.
-            q_now = _read_state()
-            base_rgb, _ = base_cam.get()
-            wrist_rgb, _ = wrist_cam.get()
-            base128 = _resize_to_128(base_rgb)
-            wrist128 = _resize_to_128(wrist_rgb)
-            rgb_concat = np.concatenate([base128, wrist128], axis=0)
-            state_hist.append(q_now)
-            img_hist.append(rgb_concat)
+            # Do NOT re-sample state/images here. The inner action loop below
+            # samples state + cameras at 30Hz into state_hist / img_hist, so
+            # after the previous chunk finished the deques already contain the
+            # most-recent two 30Hz frames (separated by ~33ms, matching how
+            # training samples its cond pair). Re-sampling here would inject a
+            # third near-duplicate "now" frame and collapse the history's
+            # 33ms gap to ~1ms, which hides the velocity cue the policy uses
+            # to decide when to close the gripper.
+            #
+            # For the very FIRST iteration, the deques were pre-filled before
+            # entering the episode loop with the at-home state duplicated,
+            # which mirrors how dataset/sequence.py pads at episode start.
+            q_now = state_hist[-1]
+            rgb_concat = img_hist[-1]
+            if args.dump_obs_dir is not None:
+                # rgb_concat is (6, 128, 128) RGB CHW. Slice the two cams back out.
+                base_hwc = np.transpose(rgb_concat[:3], (1, 2, 0))   # (128,128,3) RGB
+                wrist_hwc = np.transpose(rgb_concat[3:], (1, 2, 0))
+                cv2.imwrite(
+                    os.path.join(args.dump_obs_dir, f"step_{step:04d}_base.jpg"),
+                    cv2.cvtColor(base_hwc, cv2.COLOR_RGB2BGR),
+                )
+                cv2.imwrite(
+                    os.path.join(args.dump_obs_dir, f"step_{step:04d}_wrist.jpg"),
+                    cv2.cvtColor(wrist_hwc, cv2.COLOR_RGB2BGR),
+                )
 
             # Build cond tensors. Most-recent at end (matches sequence.py).
             state_arr = np.stack(list(state_hist), axis=0)            # (To, 7)
@@ -665,13 +770,35 @@ def main() -> None:
             img_t = torch.from_numpy(img_arr)[None].to(device).float()  # (1, To, 6, 128, 128)
             cond = {"state": state_t, "rgb": img_t}
 
+            # Flow matching's `deterministic=True` flag is a no-op in the model
+            # code (the init noise is still torch.randn each call). For eval
+            # reproducibility, optionally pass a FIXED init_noise tensor so we
+            # get the same trajectory whenever we see the same observation.
+            if args.noise_seed is not None:
+                g = torch.Generator(device=device)
+                g.manual_seed(int(args.noise_seed))
+                init_noise = torch.randn(1, horizon_steps, 7, device=device, generator=g)
+            else:
+                init_noise = None
+
             t0 = time.monotonic()
             with torch.no_grad():
-                sample = model(cond=cond, deterministic=True)
+                sample = model(cond=cond, init_noise=init_noise, deterministic=True)
             actions_n = sample.trajectories[0].cpu().numpy()           # (16, 7) in [-1, 1]
             actions = action_norm.denormalize(actions_n)               # absolute joint targets
             infer_ms = (time.monotonic() - t0) * 1000.0
 
+            # Focused gripper diagnostics: highlight the 7th dimension across
+            # the predicted chunk. Convention: 1 = OPEN, 0 = CLOSED.
+            chunk_grip = actions[:act_steps, 6]
+            grip_now = q_now[6]
+            grip_min = float(chunk_grip.min())
+            grip_max = float(chunk_grip.max())
+            grip_summary = (
+                f"grip now={grip_now:.3f}  pred_chunk[6]=["
+                + ",".join(f"{v:.2f}" for v in chunk_grip)
+                + f"]  min={grip_min:.3f} max={grip_max:.3f}"
+            )
             if args.print_actions:
                 log.info("[ep %d step %d] infer=%.1fms  q_now=%s  pred_chunk[0]=%s ... [act-1]=%s",
                          ep+1, step, infer_ms,
@@ -681,6 +808,7 @@ def main() -> None:
             else:
                 log.info("[ep %d step %d] infer=%.1fms  q_now=%s",
                          ep+1, step, infer_ms, np.round(q_now, 3).tolist())
+            log.info("    %s", grip_summary)
 
             # Execute first act_steps actions at control_hz, paced from RIGHT
             # NOW (after inference) so the chunk doesn't open with a snap.
@@ -696,21 +824,41 @@ def main() -> None:
                 if now < target_send_t:
                     time.sleep(target_send_t - now)
 
-                q_cur = _read_state()
-                delta = q_target - q_cur
-                # Clamp per-tick delta on arm joints to limit motion speed.
-                delta[:6] = np.clip(delta[:6], -args.max_joint_delta, args.max_joint_delta)
-                q_cmd = q_cur + delta
-                # Joint range clamp.
+                # Send the policy's prediction VERBATIM. Two safety nets only:
+                #   * Joint range clamp so we never command outside the YAM's
+                #     mechanical limits (hardware-mandated; cannot be removed).
+                #   * Optional --no-command_gripper for the rare case of running
+                #     with a passive teaching handle. Default ON so the policy's
+                #     full action vector reaches the motors unchanged.
+                # NO per-tick delta clamp. Earlier versions had one but it
+                # staircase-clipped the smooth trajectory the policy was trained
+                # to produce, creating visible shake and almost certainly
+                # contributing to BC's compounding error.
+                q_cmd = np.asarray(q_target, dtype=np.float64).copy()
                 np.clip(q_cmd, YAM_JOINT_LIMITS_LOW, YAM_JOINT_LIMITS_HIGH, out=q_cmd)
-                # Hold gripper at current value unless explicitly requested.
+                q_cur = _read_state()
                 if not args.command_gripper:
                     q_cmd[6] = q_cur[6]
 
                 if not args.dry_run:
                     robot.command_joint_pos(q_cmd)
-                # Pacing is enforced at the TOP of next iteration via
-                # target_send_t. Don't sleep here -- that would double-count.
+
+                # Sample the next state + images into the cond history AT 30Hz
+                # (the action rate), matching how training data was sampled.
+                # The dataset's `cond["state"]` is [state_{t-1}, state_t] with
+                # the two frames 33ms apart (consecutive samples at 30Hz). If
+                # we only refreshed the history once per chunk (every 264ms),
+                # the model sees an 8x apparent velocity in state and likely
+                # loses the deceleration cue that triggers gripper close.
+                next_base_rgb, _ = base_cam.get()
+                next_wrist_rgb, _ = wrist_cam.get()
+                next_base128 = _resize_to_128(next_base_rgb)
+                next_wrist128 = _resize_to_128(next_wrist_rgb)
+                next_rgb_concat = np.concatenate([next_base128, next_wrist128], axis=0)
+                state_hist.append(q_cur)
+                img_hist.append(next_rgb_concat)
+                # Pacing for the NEXT iteration is enforced at the TOP via
+                # target_send_t.
 
         # ---- end of episode ----
         if _abort_episode["flag"]:
