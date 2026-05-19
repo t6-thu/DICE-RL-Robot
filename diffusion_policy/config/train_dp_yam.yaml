@@ -1,0 +1,155 @@
+defaults:
+  - _self_
+  - task: yam_picknplace_arizonabottle.yaml
+
+name: dp_yam
+output_dir: ${oc.env:DICE_CHECKPOINT_FOLDERS}
+
+_target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "yam_v1"
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_timm_mod1_policy.DiffusionUnetTimmMod1Policy
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    # resnet34 has 512-ch layer4 output, matching the encoder's hardcoded
+    # feature_dim=512 (resnet18/34 range). Switch to resnet18 for faster training.
+    model_name: resnet34.a1_in1k
+    pretrained: True
+    global_pool: ""          # must be "" — spatial features
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+    use_group_norm: True
+    share_rgb_model: False   # separate backbone per camera
+    imagenet_norm: True
+    frozen: False
+    downsample_ratio: 32
+    feature_aggregation: spatial_embedding
+    position_encording: learnable
+
+  num_inference_steps: 16
+  obs_as_cond: True
+  diffusion_step_embed_dim: 128
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+
+  # UNet input = action_horizon × action_dim
+  horizon: ${task.action_horizon}
+  n_action_steps: ${task.action_horizon}
+  n_obs_steps: ${task.obs_horizon}
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: cuda
+  seed: 42
+  debug: False
+  resume: True
+  use_ema: True
+  # epochs / scheduling
+  num_epochs: 3000
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  gradient_accumulate_every: 1
+  # step limits (null = unlimited)
+  max_train_steps: null
+  max_val_steps: null
+  # logging / checkpointing cadence
+  rollout_every: null
+  checkpoint_every: 50
+  val_every: 10
+  sample_every: 999999  # effectively never — newer diffusers DDIMScheduler.step() drops obs_as_cond kwarg
+  tqdm_interval_sec: 1.0
+  log_gradient_norm: False
+  # encoder
+  freeze_encoder: False
+  # dense (not used for YAM — set dummy values to satisfy workspace checks)
+  dense_training_start_epochs: 999999
+  dense_gradient_norm_limit: null
+  sparse_gradient_norm_limit: null
+  # GT-trajectory supervision (disabled)
+  gt_traj_num_epochs: 0
+  # normalizer warmup — workspace expects a 2-element list [start, end] even
+  # when normalization_weight is 0. Use [0.0, 0.0] to always produce weight=0.
+  normalization_schedule: [0.0, 0.0]
+  normalization_weight: 0.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: offline     # switch to "online" to enable W&B
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  project: diffusion_policy
+  resume: True
+  tags:
+    - ${name}
+    - ${task_name}
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 5
+    format_str: "epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt"
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: "data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}"
+  wandb_name_base: "${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}"
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: ${output_dir}/${now:%Y.%m.%d}/${now:%H.%M.%S}_${exp_name}_${task.name}
+  sweep:
+    dir: ${output_dir}/${now:%Y.%m.%d}/${now:%H.%M.%S}_${exp_name}_${task.name}
+    subdir: ${hydra.job.num}

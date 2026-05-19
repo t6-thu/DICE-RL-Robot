@@ -1,0 +1,52 @@
+name: yam_picknplace_arizonabottle
+
+# Action chunking parameters (30 Hz data).
+#   obs_horizon=2: pass last 2 frames of state+image to the policy.
+#   action_horizon=16: policy predicts 16 future joint targets (~0.53 s).
+obs_horizon: 2
+action_horizon: 16
+
+# Relative path or absolute path to the processed npz (set via env var).
+dataset_path: ${oc.env:DICE_DATASET_FOLDERS}/yam_picknplace_arizonabottle/train.npz
+
+shape_meta: &shape_meta
+  obs:
+    rgb_0:          # base camera
+      shape: [3, 128, 128]
+      type: rgb
+    rgb_1:          # wrist camera
+      shape: [3, 128, 128]
+      type: rgb
+    joint_pos:      # 7-D: 6 arm joints + 1 gripper, normalized [-1, 1]
+      shape: [7]
+      type: low_dim
+
+  action:
+    shape: [7]      # joint position targets (same space)
+
+  sample:
+    obs:
+      sparse:
+        rgb_0:
+          horizon: ${task.obs_horizon}
+          down_sample_steps: 1
+        rgb_1:
+          horizon: ${task.obs_horizon}
+          down_sample_steps: 1
+        joint_pos:
+          horizon: ${task.obs_horizon}
+          down_sample_steps: 1
+    action:
+      sparse:
+        horizon: ${task.action_horizon}
+        down_sample_steps: 1
+    training_duration_per_sparse_query: 600   # ~18s @ 30 Hz × 16 steps
+
+dataset:
+  _target_: diffusion_policy.dataset.yam_npz_dataset.YAMNpzDataset
+  dataset_path: ${task.dataset_path}
+  obs_horizon: ${task.obs_horizon}
+  action_horizon: ${task.action_horizon}
+  image_size: 128
+  val_ratio: 0.05
+  seed: 42

@@ -191,8 +191,13 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
             )
 
             # 3. compute previous image: x_t -> x_t-1
+            # Strip kwargs not accepted by newer diffusers schedulers (e.g.
+            # obs_as_cond was dropped from DDIMScheduler.step in diffusers ≥ 0.28).
+            import inspect
+            accepted = set(inspect.signature(scheduler.step).parameters.keys())
+            safe_kwargs = {k: v for k, v in kwargs.items() if k in accepted}
             trajectory = scheduler.step(
-                model_output, t, trajectory, generator=generator, **kwargs
+                model_output, t, trajectory, generator=generator, **safe_kwargs
             ).prev_sample
 
         # finally make sure conditioning is enforced
