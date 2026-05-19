@@ -29,20 +29,21 @@ policy:
   obs_encoder:
     _target_: diffusion_policy.model.vision.timm_obs_encoder.TimmObsEncoder
     shape_meta: ${shape_meta}
-    # resnet34 has 512-ch layer4 output, matching the encoder's hardcoded
-    # feature_dim=512 (resnet18/34 range). Switch to resnet18 for faster training.
-    model_name: resnet34.a1_in1k
+    # ViT-base-patch32-CLIP at 224x224 — faithful to DICE-RL Appendix C.
+    # Uses the CLS token as the global visual feature (768-D per camera per
+    # obs step). feature_aggregation must be null for ViT.
+    model_name: vit_base_patch32_clip_224.openai
     pretrained: True
-    global_pool: ""          # must be "" — spatial features
+    global_pool: ""          # "" = return all tokens; CLS is extracted in aggregate_feature
     transforms:
       - type: RandomCrop
         ratio: 0.95
-    use_group_norm: True
-    share_rgb_model: False   # separate backbone per camera
+    use_group_norm: False    # ViT has LayerNorm, not BatchNorm — skip group-norm replacement
+    share_rgb_model: False   # separate ViT per camera
     imagenet_norm: True
     frozen: False
-    downsample_ratio: 32
-    feature_aggregation: spatial_embedding
+    feature_aggregation: null   # ViT uses CLS token; spatial_embedding only for ResNets
+    downsample_ratio: 32        # ignored for ViT but required by encoder __init__
     position_encording: learnable
 
   num_inference_steps: 16

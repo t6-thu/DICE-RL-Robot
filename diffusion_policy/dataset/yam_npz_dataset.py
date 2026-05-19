@@ -42,7 +42,7 @@ class YAMNpzDataset(BaseImageDataset):
         dataset_path: str,
         obs_horizon: int = 1,
         action_horizon: int = 16,
-        image_size: int = 128,
+        image_size: int = 224,
         val_ratio: float = 0.02,
         seed: int = 42,
     ) -> None:

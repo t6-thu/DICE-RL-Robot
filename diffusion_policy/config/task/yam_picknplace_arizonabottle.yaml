@@ -7,15 +7,15 @@ obs_horizon: 2
 action_horizon: 16
 
 # Relative path or absolute path to the processed npz (set via env var).
-dataset_path: ${oc.env:DICE_DATASET_FOLDERS}/yam_picknplace_arizonabottle/train.npz
+dataset_path: ${oc.env:DICE_DATASET_FOLDERS}/yam_picknplace_arizonabottle_224/train.npz
 
 shape_meta: &shape_meta
   obs:
     rgb_0:          # base camera
-      shape: [3, 128, 128]
+      shape: [3, 224, 224]
       type: rgb
     rgb_1:          # wrist camera
-      shape: [3, 128, 128]
+      shape: [3, 224, 224]
       type: rgb
     joint_pos:      # 7-D: 6 arm joints + 1 gripper, normalized [-1, 1]
       shape: [7]
