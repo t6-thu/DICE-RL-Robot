@@ -184,6 +184,7 @@ class YAMRLLearner:
 
         self.total_episodes = 0
         self.total_gradient_steps = 0
+        self._recent_outcomes: list = []  # track success/failure for reporting
         self._maybe_resume_checkpoint()
 
     # ------------------------------------------------------------------
@@ -210,18 +211,37 @@ class YAMRLLearner:
 
             self.replay_buffer.add_episode(episode_data)
             self.total_episodes += 1
-            log.info("Episode received (#%d). Online transitions: %d",
-                     self.total_episodes, self.replay_buffer.num_online_transitions)
+            success = bool(episode_data.get("success", False))
+            self._recent_outcomes.append(success)
+            log.info("Episode received (#%d) [%s]. Online transitions: %d",
+                     self.total_episodes,
+                     "SUCCESS" if success else "FAILURE",
+                     self.replay_buffer.num_online_transitions)
 
             # ---- decide whether to train ----
             past_warmup = self.total_episodes >= self.num_episodes_before_first_training
             trigger = (self.total_episodes - self.num_episodes_before_first_training) \
                       % self.update_every_x_episode == 0
             if past_warmup and trigger:
+                self._log_success_rate()
                 log.info("Training round %d  (%d gradient steps)…",
                          self.total_episodes, self.gradient_steps)
                 self._train_round()
                 self._push_actor_weights()
+
+    def _log_success_rate(self) -> None:
+        n   = len(self._recent_outcomes)
+        win = self._recent_outcomes[-self.update_every_x_episode:]
+        win_rate  = sum(win) / len(win) * 100 if win else 0.0
+        all_rate  = sum(self._recent_outcomes) / n * 100 if n else 0.0
+        bar = "█" * sum(win) + "░" * (len(win) - sum(win))
+        log.info("=" * 55)
+        log.info("  SUCCESS RATE — last %d episodes: %d/%d  (%.0f%%)  [%s]",
+                 len(win), sum(win), len(win), win_rate, bar)
+        log.info("  SUCCESS RATE — all  %d episodes: %d/%d  (%.0f%%)",
+                 n, sum(self._recent_outcomes), n, all_rate)
+        log.info("=" * 55)
+        self._recent_outcomes.clear()
 
     def _train_round(self) -> None:
         """Run gradient_steps actor+critic updates."""
