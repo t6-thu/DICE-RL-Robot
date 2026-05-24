@@ -1,0 +1,179 @@
+"""DICE-RL finetuning config for YAM joint-space diffusion policy.
+
+=============================================================
+DICE-RL ALGORITHM — HOW IT WORKS ON YAM
+=============================================================
+
+Phase 1: Warmup (20 pure-BC rollouts)
+--------------------------------------
+  Collect `num_episodes_before_first_training` episodes using only the frozen
+  BC diffusion policy (no residual actor yet).  All rollouts are stored in the
+  online replay buffer.
+
+Phase 2: RLPD training rounds (every 10 rollouts)
+--------------------------------------------------
+  After each block of `update_every_x_episode` new rollouts, the learner runs
+  `gradient_steps` actor + critic updates:
+
+    for each gradient step:
+        batch = 128 expert samples  +  128 online samples   (batch_size=256)
+            ← expert = BC training demonstrations (50% initially, annealed to 20%)
+            ← online = robot rollouts collected so far
+
+        1. Critic update (RLPD ensemble Q-learning):
+               Q_target = r + γ · min_k Q_k(s', a'_actor)
+               critic_loss = mean MSE over 5 critics
+
+        2. Actor update (DDPO + BC regularisation):
+               q_loss = -min_k Q_k(s, actor(s))
+               bc_loss = MSE(actor(s), frozen_BC_action(s))
+               actor_loss = q_loss + bc_loss_weight * bc_loss
+
+        3. Target critic update (Polyak):
+               θ_target = (1 - τ) θ_target + τ θ
+
+  Then the learner pushes the updated residual actor weights to the env runner.
+
+Phase 3: Inference with residual correction
+--------------------------------------------
+  For each inference step:
+      features  = frozen_BC_encoder(obs_history)
+      bc_action = BC_diffusion_forward(features)       # in normalized [-1, 1]
+      delta     = residual_actor(features, noise)       # learned correction
+      final_act = clamp(bc_action + delta, -1, 1)       # normalized
+      joint_cmd = denormalize(final_act)                 # → i2rt raw joint targets
+
+Reward
+------
+  Sparse binary: success = 1.0, failure = 0.0, collected at episode end via
+  keyboard input (s / f / d).
+
+=============================================================
+KEY HYPERPARAMETERS & THEIR EFFECT
+=============================================================
+
+  num_episodes_before_first_training = 20
+      How many rollouts to collect before any RL gradient steps.
+      More = stabler Q estimates at first training; less = faster RL.
+
+  update_every_x_episode = 10
+      One training round per N new rollouts.
+      Fewer = more frequent updates (aggressive); more = more data per round.
+
+  gradient_steps = 2000
+      Gradient updates per training round.
+      2000 steps × batch_size 256 = 512k sample transitions per round.
+
+  batch_size = 256
+      Half expert (from BC training npz), half online.
+      Expert fraction decays from 0.7 → 0.2 over 30000 steps.
+
+  bc_loss_weight = 100
+      How strongly the actor is regularised towards the BC policy.
+      High value = conservative exploration; low value = more deviation.
+
+  critic_ensemble_size = 5
+      Number of Q-networks. min-Q across ensemble = pessimistic estimate
+      (reduces overestimation in offline data).
+
+  gamma = 0.99
+      Discount factor. With episode length ~200 steps, effective horizon ≈ 50
+      steps for 99% discount.
+
+  tau = 0.01
+      Polyak averaging rate for target critics. Slow = stable Q targets.
+=============================================================
+"""
+
+import os
+
+if "DICE_DATASET_FOLDERS" not in os.environ:
+    raise ValueError("Run: . ./prepare.sh  first (to set DICE_DATASET_FOLDERS etc.)")
+
+_ckpt_dir  = os.environ.get("DICE_CHECKPOINT_FOLDERS",
+                             os.path.expanduser("~/training_outputs"))
+_data_dir  = os.environ.get("DICE_DATASET_FOLDERS",
+                             os.path.expanduser("~/data/real_processed"))
+
+# ============================================================
+# TODO: set before running
+# ============================================================
+BC_POLICY_CKPT = os.path.expanduser(
+    "~/training_outputs/2026.05.19/00.34.02_yam_vit_clip_v1_yam_picknplace_arizonabottle"
+    "/checkpoints/epoch=0500-train_loss=0.013.ckpt"
+)
+EXPERT_NPZ = os.path.join(_data_dir,
+                          "yam_picknplace_arizonabottle_224", "train.npz")
+NORM_NPZ   = os.path.join(_data_dir,
+                          "yam_picknplace_arizonabottle_224", "normalization.npz")
+ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts")
+RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning")
+
+# ============================================================
+# Training algorithm settings
+# ============================================================
+TRAINING = dict(
+    # --- Rollout / training cadence ---
+    num_episodes_before_first_training = 20,
+    # Collect 20 pure-BC episodes first, then start RL.
+
+    update_every_x_episode             = 10,
+    # One training round per 10 new rollouts.
+
+    gradient_steps                     = 2000,
+    # 2000 actor+critic updates per training round.
+    # Effective data: 2000 × 256 = 512k transitions per round.
+
+    # --- Batch composition ---
+    batch_size  = 256,       # 128 expert + 128 online per step
+    obs_horizon = 2,         # must match BC training (2 frames of history)
+    action_horizon = 16,     # must match BC training
+    action_dim     = 7,      # YAM: 6 arm joints + 1 gripper
+
+    # --- RLPD expert ratio (anneals from 70% to 20%) ---
+    use_adaptive_expert_ratio   = True,
+    adaptive_expert_ratio_start = 0.7,
+    adaptive_expert_ratio_end   = 0.2,
+    adaptive_expert_ratio_steps = 30000,
+
+    # --- RL algorithm ---
+    gamma                = 0.99,
+    tau                  = 0.01,     # target critic Polyak rate
+    actor_lr             = 1e-4,
+    critic_lr            = 1e-4,
+    bc_loss_weight       = 100.0,    # BC regularisation weight on actor
+    critic_ensemble_size = 5,
+    max_grad_norm        = 1.0,
+)
+
+# ============================================================
+# Network architecture
+# ============================================================
+NETWORK = dict(
+    actor_hidden_dims  = [1024, 1024, 1024],
+    critic_hidden_dims = [1024, 1024, 1024],
+)
+
+# ============================================================
+# Hardware
+# ============================================================
+HARDWARE = dict(
+    can_channel       = "can_follower_l",
+    gripper_type      = "crank_4310",
+    base_cam_serial   = "218622278369",
+    wrist_cam_serial  = "218622271309",
+    home_joint_pos    = [-0.010, 0.833, 0.903, -0.598, -0.028, -0.029],
+    home_gripper_pos  = 1.0,
+    control_hz        = 30.0,
+    max_episode_steps = 200,
+)
+
+# ============================================================
+# ZMQ endpoints (IPC = same machine; TCP = different machines)
+# ============================================================
+COMM = dict(
+    network_server_endpoint     = "ipc:///tmp/feeds/rl_weights",
+    network_weight_topic        = "rl_network_weights_topic",
+    transitions_server_endpoint = "ipc:///tmp/feeds/rl_transitions",
+    transitions_topic           = "rl_transitions_topic",
+)
