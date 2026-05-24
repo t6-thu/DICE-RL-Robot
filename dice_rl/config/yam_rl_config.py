@@ -159,7 +159,7 @@ NETWORK = dict(
 # ============================================================
 HARDWARE = dict(
     can_channel       = "can_follower_l",
-    gripper_type      = "crank_4310",
+    gripper_type      = "linear_4310",
     base_cam_serial   = "218622278369",
     wrist_cam_serial  = "218622271309",
     home_joint_pos    = [-0.010, 0.833, 0.903, -0.598, -0.028, -0.029],

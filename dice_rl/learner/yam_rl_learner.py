@@ -27,6 +27,7 @@ Key hyperparams (from rl_finetuning_config.py)
 """
 
 from __future__ import annotations
+import glob
 import logging
 import os
 import pickle
@@ -183,6 +184,7 @@ class YAMRLLearner:
 
         self.total_episodes = 0
         self.total_gradient_steps = 0
+        self._maybe_resume_checkpoint()
 
     # ------------------------------------------------------------------
     # Public API
@@ -365,6 +367,25 @@ class YAMRLLearner:
             topic=self.learner_node.network_weight_topic,
         )
         log.info("Pushed actor weights (step %d)", self.total_gradient_steps)
+
+    def _maybe_resume_checkpoint(self) -> None:
+        if not self.rl_checkpoint_dir:
+            return
+        ckpts = sorted(glob.glob(os.path.join(self.rl_checkpoint_dir, "checkpoint_*.pt")))
+        if not ckpts:
+            return
+        path = ckpts[-1]
+        log.info("Resuming from checkpoint: %s", path)
+        ckpt = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(ckpt["actor"])
+        for c, sd in zip(self.critics, ckpt["critics"]):
+            c.load_state_dict(sd)
+        for ct, sd in zip(self.critic_targets, ckpt["critics"]):
+            ct.load_state_dict(sd)
+        self.total_gradient_steps = ckpt["total_gradient_steps"]
+        self.total_episodes       = ckpt["total_episodes"]
+        log.info("Resumed: total_episodes=%d  total_gradient_steps=%d",
+                 self.total_episodes, self.total_gradient_steps)
 
     def _save_checkpoint(self) -> None:
         path = os.path.join(

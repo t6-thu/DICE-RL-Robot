@@ -70,13 +70,24 @@ class YAMReplayBuffer:
         self.online_data_dir = online_data_dir
         os.makedirs(online_data_dir, exist_ok=True)
         self._max_online = max_online_size
-        # Each entry: (obs_dict, action, reward, next_obs_dict, done)
         self._online: deque = deque(maxlen=max_online_size)
         self._num_online_episodes = 0
+        self._load_existing_episodes()
 
     # ------------------------------------------------------------------
     # Episode insertion
     # ------------------------------------------------------------------
+
+    def _load_existing_episodes(self) -> None:
+        paths = sorted(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
+        if not paths:
+            return
+        log.info("Reloading %d saved episodes from %s", len(paths), self.online_data_dir)
+        for p in paths:
+            d = np.load(p)
+            self.add_episode({k: d[k] for k in d.files})
+        log.info("Online buffer restored: %d transitions from %d episodes",
+                 len(self._online), self._num_online_episodes)
 
     def add_episode(self, episode: dict) -> None:
         """Add one online rollout episode to the buffer.

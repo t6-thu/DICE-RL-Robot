@@ -17,6 +17,7 @@ Algorithm (one episode)
 """
 
 from __future__ import annotations
+import glob
 import logging
 import os
 import pickle
@@ -187,8 +188,9 @@ class YAMRLEnvRunner:
             transitions_topic_expire_time_s=3600,
         )
 
-        self._abort_episode = {"flag": False}
-        self._sigint_count  = 0
+        self._abort_episode  = {"flag": False}
+        self._in_episode     = False
+        self._last_sigint_t  = 0.0   # debounce: ignore rapid duplicate SIGINTs
         signal.signal(signal.SIGINT,  self._sigint)
         signal.signal(signal.SIGTERM, self._sigterm)
         signal.signal(signal.SIGQUIT, self._sigquit)  # Ctrl-\  → instant kill
@@ -247,6 +249,7 @@ class YAMRLEnvRunner:
 
         images_rec, states_rec, actions_rec, rewards_rec = [], [], [], []
         self._abort_episode["flag"] = False
+        self._in_episode = True
 
         for step in range(self.max_episode_steps):
             if self._abort_episode["flag"]:
@@ -289,6 +292,7 @@ class YAMRLEnvRunner:
                      step, infer_ms, np.round(self._read_state(), 3).tolist())
 
         # ---- user labels success/failure ----
+        self._in_episode = False
         import termios; termios.tcflush(sys.stdin, termios.TCIFLUSH)
         print("\nEpisode ended.  s=success  f=failure  d=discard: ", end="", flush=True)
         label = input().strip().lower()
@@ -327,22 +331,34 @@ class YAMRLEnvRunner:
         # Auto-home before the very first episode.
         self._move_to_home()
 
-        ep = 0
+        # Count already-saved episodes so numbering stays consistent across restarts.
+        ep = len(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
+        if ep > 0:
+            log.info("Resuming: %d episodes already saved in %s", ep, self.online_data_dir)
+
         while True:
             # Check for updated actor weights from learner.
             self._try_update_actor()
 
-            input(f"\n[Episode {ep+1}] Press Enter to start, or Ctrl-C to abort.")
+            input(f"\n[Episode {ep+1}] Press Enter to start, or Ctrl-C to exit.")
             ep_data = self.run_episode()
             if ep_data.get("discard"):
                 log.info("Episode discarded.")
-                # Still auto-home before next try.
                 self._move_to_home()
                 continue
 
+            # Save episode to disk (survives learner/runner crashes).
+            ep_path = os.path.join(self.online_data_dir, f"episode_{ep:04d}.npz")
+            np.savez_compressed(ep_path,
+                                images=ep_data["images"],
+                                states=ep_data["states"],
+                                actions=ep_data["actions"],
+                                rewards=ep_data["rewards"],
+                                dones=ep_data["dones"])
+
             # Send episode to learner.
             self.actor_node.send_transitions(pickle.dumps(ep_data))
-            log.info("Episode %d sent to learner (success=%s)", ep+1, ep_data["success"])
+            log.info("Episode %d saved+sent (success=%s)", ep+1, ep_data["success"])
             ep += 1
 
             # Auto-home at end of every episode (ready for the next one).
@@ -371,13 +387,16 @@ class YAMRLEnvRunner:
             log.debug("Weight update check: %s", e)
 
     def _sigint(self, *_) -> None:
-        self._sigint_count += 1
-        if self._sigint_count == 1:
-            log.info("Ctrl-C (1/2): aborting current episode gracefully. "
-                     "Press Ctrl-C again to force-quit, or Ctrl-\\ to hard-kill.")
+        now = time.monotonic()
+        if now - self._last_sigint_t < 0.5:
+            return  # debounce: one physical keypress can fire the handler twice
+        self._last_sigint_t = now
+
+        if self._in_episode:
+            log.info("Ctrl-C: aborting episode. Use Ctrl-\\ to force-quit.")
             self._abort_episode["flag"] = True
         else:
-            log.info("Ctrl-C (2/2): force-quitting.")
+            log.info("Ctrl-C: exiting.")
             os._exit(130)
 
     def _sigterm(self, *_) -> None:
