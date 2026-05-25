@@ -41,11 +41,13 @@ class YAMReplayBuffer:
         online_data_dir: str,
         obs_horizon: int = 2,
         action_dim: int = 7,
+        action_horizon: int = 16,
         max_online_size: int = 50_000,
         device: str = "cuda",
     ) -> None:
         self.obs_horizon = obs_horizon
         self.action_dim = action_dim
+        self.action_horizon = action_horizon
         self.device = torch.device(device)
 
         # ---- expert buffer (preloaded from BC training npz) ----
@@ -79,13 +81,17 @@ class YAMReplayBuffer:
     # ------------------------------------------------------------------
 
     def _load_existing_episodes(self) -> None:
+        self.loaded_paths: list = []
         paths = sorted(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
         if not paths:
             return
-        log.info("Reloading %d saved episodes from %s", len(paths), self.online_data_dir)
-        for p in paths:
+        log.info("Loading %d saved episodes from disk (please wait)…", len(paths))
+        for i, p in enumerate(paths):
             d = np.load(p)
             self.add_episode({k: d[k] for k in d.files})
+            self.loaded_paths.append(p)
+            if (i + 1) % 5 == 0 or (i + 1) == len(paths):
+                log.info("  … %d/%d episodes loaded", i + 1, len(paths))
         log.info("Online buffer restored: %d transitions from %d episodes",
                  len(self._online), self._num_online_episodes)
 
@@ -110,7 +116,10 @@ class YAMReplayBuffer:
         for t in range(T - 1):
             obs      = self._make_obs(I, S, t,   ep_start)
             next_obs = self._make_obs(I, S, t+1, ep_start)
-            self._online.append((obs, A[t], R[t], next_obs, D[t]))
+            a = A[t]
+            if a.ndim == 1:  # single action (7,) → tile to (H, 7)
+                a = np.tile(a, (self.action_horizon, 1))
+            self._online.append((obs, a, R[t], next_obs, D[t]))
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
@@ -119,9 +128,12 @@ class YAMReplayBuffer:
     def _make_obs(self, images, states, t, ep_start):
         """Build the obs history dict at time t (padded at episode start)."""
         frames, jnts = [], []
+        uint8 = (images.dtype == np.uint8)
         for k in range(self.obs_horizon - 1, -1, -1):
             idx = max(t - k, ep_start)
-            frames.append(images[idx].astype(np.float32) / 255.0)  # (6, H, W) [0,1]
+            raw = images[idx].astype(np.float32)
+            # Expert images are uint8 [0,255]; online images are float32 [0,1] already.
+            frames.append(raw / 255.0 if uint8 else raw)  # (6, H, W) [0,1]
             jnts.append(states[idx])
         return {
             "rgb_0":     np.stack([f[:3] for f in frames]),   # (To, 3, H, W)
@@ -164,7 +176,7 @@ class YAMReplayBuffer:
             o  = self._make_obs(self._expert_images, self._expert_states, t,   ep_start)
             no = self._make_obs(self._expert_images, self._expert_states, t+1, ep_start)
             obs_list.append(o); next_obs_list.append(no)
-            acts.append(self._expert_actions[t])
+            acts.append(np.tile(self._expert_actions[t], (self.action_horizon, 1)))
             rews.append(1.0)   # expert demonstrations treated as success
             dones.append(False)
         return _pack(obs_list, acts, rews, next_obs_list, dones, dev)

@@ -126,6 +126,7 @@ class YAMRLLearner:
         # ---- residual actor ----
         ah = actor_hidden_dims or [1024, 1024, 1024]
         ch = critic_hidden_dims or [1024, 1024, 1024]
+        self._actor_hidden_dims = ah
         self.actor = DistilledActor(
             obs_dim=obs_feature_dim,
             action_dim=action_dim,
@@ -170,6 +171,7 @@ class YAMRLLearner:
             online_data_dir=online_data_dir,
             obs_horizon=obs_horizon,
             action_dim=action_dim,
+            action_horizon=action_horizon,
             device=device,
         )
 
@@ -185,15 +187,35 @@ class YAMRLLearner:
         self.total_episodes = 0
         self.total_gradient_steps = 0
         self._recent_outcomes: list = []  # track success/failure for reporting
-        self._maybe_resume_checkpoint()
+        # Track which on-disk episode files have already been loaded — used by
+        # the disk-polling loop in run() to pick up new files without dupes.
+        # Reuse the buffer's own loaded-path list to avoid any glob race.
+        self._online_data_dir = online_data_dir
+        self._loaded_disk_files: set = set(getattr(self.replay_buffer, "loaded_paths", []))
+        resumed = self._maybe_resume_checkpoint()
+        # Sync total_episodes from disk-restored episodes so the training trigger
+        # fires at the right episode count after a restart.
+        disk_eps = self.replay_buffer._num_online_episodes
+        if disk_eps > self.total_episodes:
+            self.total_episodes = disk_eps
+            log.info("Synced total_episodes=%d from disk replay buffer", self.total_episodes)
+        # Push current weights immediately so env runner can load them on startup.
+        if resumed or self.total_gradient_steps > 0:
+            self._push_actor_weights()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Main learner loop: listen for episodes, train, push weights."""
-        log.info("Learner running. Waiting for episodes…")
+        """Main learner loop: poll disk for new episode files, train, push weights.
+
+        Uses disk polling (not ZMQ) as the authoritative episode source.
+        The env runner saves every episode as `episode_NNNN.npz` to
+        `online_data_dir`. The learner picks them up here.
+        """
+        log.info("Learner running. Polling %s every 2 s for new episodes…",
+                 self._online_data_dir)
         log.info("  num_episodes_before_first_training = %d",
                  self.num_episodes_before_first_training)
         log.info("  update_every_x_episode             = %d",
@@ -201,33 +223,69 @@ class YAMRLLearner:
         log.info("  gradient_steps per round           = %d", self.gradient_steps)
         log.info("  batch_size (expert+online)         = %d  (expert_ratio=%.1f%%)",
                  self.batch_size, self.expert_ratio * 100)
+        log.info("  starting at total_episodes=%d, total_gradient_steps=%d",
+                 self.total_episodes, self.total_gradient_steps)
 
         while True:
-            # ---- receive an episode ----
-            episode_data = self._receive_episode()
-            if episode_data is None:
-                time.sleep(0.1)
-                continue
-
-            self.replay_buffer.add_episode(episode_data)
-            self.total_episodes += 1
-            success = bool(episode_data.get("success", False))
-            self._recent_outcomes.append(success)
-            log.info("Episode received (#%d) [%s]. Online transitions: %d",
-                     self.total_episodes,
-                     "SUCCESS" if success else "FAILURE",
-                     self.replay_buffer.num_online_transitions)
+            new_count = self._scan_new_disk_episodes()
+            if new_count > 0 and self.total_gradient_steps > 0:
+                # Re-push current weights so env runner always has the latest actor.
+                self._push_actor_weights()
 
             # ---- decide whether to train ----
-            past_warmup = self.total_episodes >= self.num_episodes_before_first_training
-            trigger = (self.total_episodes - self.num_episodes_before_first_training) \
-                      % self.update_every_x_episode == 0
-            if past_warmup and trigger:
-                self._log_success_rate()
-                log.info("Training round %d  (%d gradient steps)…",
-                         self.total_episodes, self.gradient_steps)
-                self._train_round()
-                self._push_actor_weights()
+            # Cumulative "rounds done vs expected" check — runs every iteration
+            # so we catch up after a restart even if no new episodes arrive.
+            if self.total_episodes >= self.num_episodes_before_first_training:
+                expected_rounds = (
+                    (self.total_episodes - self.num_episodes_before_first_training)
+                    // self.update_every_x_episode + 1
+                )
+                done_rounds = self.total_gradient_steps // self.gradient_steps
+                if expected_rounds > done_rounds:
+                    self._log_success_rate()
+                    log.info("Training round (episode %d): expected=%d done=%d → training…",
+                             self.total_episodes, expected_rounds, done_rounds)
+                    self._train_round()
+                    self._push_actor_weights()
+                    continue  # immediately re-check (no sleep) after training
+
+            if new_count == 0:
+                time.sleep(2.0)
+
+    def _scan_new_disk_episodes(self) -> int:
+        """Load any new episode_*.npz files from disk that aren't in the buffer yet.
+
+        Returns the number of episodes ACTUALLY loaded (not just discovered).
+        Files that look in-progress (mtime <2 s) are silently retried next pass.
+        """
+        paths = sorted(glob.glob(os.path.join(self._online_data_dir, "episode_*.npz")))
+        new_paths = [p for p in paths if p not in self._loaded_disk_files]
+        if not new_paths:
+            return 0
+        loaded_count = 0
+        for p in new_paths:
+            # Skip files that look like they're still being written (modified <2 s ago).
+            try:
+                if time.time() - os.path.getmtime(p) < 2.0:
+                    continue  # not added to _loaded_disk_files → retry next pass
+                d = np.load(p)
+                ep_data = {k: d[k] for k in d.files}
+            except Exception as e:
+                log.warning("Episode %s not yet readable (%s); will retry", p, e)
+                continue
+            self.replay_buffer.add_episode(ep_data)
+            self.total_episodes += 1
+            rewards = ep_data.get("rewards", np.zeros(1, dtype=np.float32))
+            success = bool(rewards[-1] > 0.5) if len(rewards) > 0 else False
+            self._recent_outcomes.append(success)
+            log.info("New episode from disk (#%d) [%s] %s — online transitions: %d",
+                     self.total_episodes,
+                     "SUCCESS" if success else "FAILURE",
+                     os.path.basename(p),
+                     self.replay_buffer.num_online_transitions)
+            self._loaded_disk_files.add(p)
+            loaded_count += 1
+        return loaded_count
 
     def _log_success_rate(self) -> None:
         n   = len(self._recent_outcomes)
@@ -244,16 +302,56 @@ class YAMRLLearner:
         self._recent_outcomes.clear()
 
     def _train_round(self) -> None:
-        """Run gradient_steps actor+critic updates."""
-        for step in range(self.gradient_steps):
-            er = self._current_expert_ratio()
-            batch = self.replay_buffer.sample(self.batch_size, expert_ratio=er)
-            if not batch:
-                log.warning("Empty batch — skipping")
-                continue
+        """Run gradient_steps actor+critic updates with pre-encoded feature pool.
 
-            c_loss = self._critic_update(batch)
-            a_loss = self._actor_update(batch)
+        ViT runs only during pool encoding (2 passes total), not inside the
+        gradient loop — this gives a ~40× speedup over per-step encoding.
+        """
+        er = self._current_expert_ratio()
+
+        # Build feature pool in small mini-batches to stay within GPU memory.
+        pool_size = min(self.gradient_steps * self.batch_size, 10_000)
+        encode_bs = 256
+        log.info("Pre-encoding feature pool (%d transitions, mini-batch=%d)…",
+                 pool_size, encode_bs)
+        feat_list, fnext_list, act_list, rew_list, done_list = [], [], [], [], []
+        n = 0
+        while n < pool_size:
+            bs = min(encode_bs, pool_size - n)
+            raw = self.replay_buffer.sample(bs, expert_ratio=er)
+            if not raw:
+                break
+            with torch.no_grad():
+                feat_list.append(self._encode_obs(raw["obs"]))
+                fnext_list.append(self._encode_obs(raw["next_obs"]))
+            act_list.append(raw["action"])
+            rew_list.append(raw["reward"])
+            done_list.append(raw["done"])
+            n += bs
+
+        if not feat_list:
+            log.warning("Empty replay buffer — skipping training round")
+            return
+
+        pool_feat      = torch.cat(feat_list)   # (N, feat_dim)
+        pool_feat_next = torch.cat(fnext_list)  # (N, feat_dim)
+        pool_act       = torch.cat(act_list)    # (N, H, D)
+        pool_rew       = torch.cat(rew_list)    # (N, 1)
+        pool_done      = torch.cat(done_list)   # (N, 1)
+        N = pool_feat.shape[0]
+        log.info("Pool ready (%d features). Running %d MLP-only gradient steps…",
+                 N, self.gradient_steps)
+
+        for step in range(self.gradient_steps):
+            idx = torch.randint(0, N, (self.batch_size,), device=self.device)
+            feat      = pool_feat[idx]
+            feat_next = pool_feat_next[idx]
+            act       = pool_act[idx]
+            rew       = pool_rew[idx]
+            done      = pool_done[idx]
+
+            c_loss = self._critic_update_feat(feat, act, rew, feat_next, done)
+            a_loss = self._actor_update_feat(feat)
             self._update_target_critics()
             self.total_gradient_steps += 1
 
@@ -262,7 +360,6 @@ class YAMRLLearner:
                          "expert_ratio=%.2f",
                          step, self.gradient_steps, c_loss, a_loss, er)
 
-        # Save checkpoint every round.
         if self.rl_checkpoint_dir:
             self._save_checkpoint()
 
@@ -272,66 +369,65 @@ class YAMRLLearner:
 
     def _encode_obs(self, obs: dict) -> torch.Tensor:
         """Run frozen BC policy encoder on obs, return (B, feature_dim)."""
-        # obs keys: rgb_0 (B,To,3,H,W), rgb_1, joint_pos (B,To,7)
         nobs = {k: self.bc_policy.sparse_normalizer[k].normalize(v)
                 for k, v in obs.items()}
         with torch.no_grad():
             return self.bc_policy.obs_encoder(nobs)
 
-    def _critic_update(self, batch: dict) -> float:
-        obs, act, rew, next_obs, done = (
-            batch["obs"], batch["action"], batch["reward"],
-            batch["next_obs"], batch["done"],
-        )
+    def _critic_update_feat(self, feat, act, rew, feat_next, done) -> float:
+        """Critic TD update using pre-encoded features (no ViT call).
+
+        Residual setup: target action = clamp(BC(s') + actor(s')) so the critic
+        is trained on the same action distribution it will see at inference.
+        """
         with torch.no_grad():
-            feat_next = self._encode_obs(next_obs)
-            noise = torch.randn(
-                feat_next.shape[0], self.action_horizon, self.action_dim,
-                device=self.device,
-            )
-            next_act_n = self.actor(feat_next.unsqueeze(1), noise)  # normalized
-            # target Q
-            q_targets = [ct(feat_next, noise, next_act_n) for ct in self.critic_targets]
-            q_target = torch.min(torch.stack(q_targets, dim=-1), dim=-1).values
+            noise = torch.randn(feat_next.shape[0], self.action_horizon,
+                                self.action_dim, device=self.device)
+            delta_next = self.actor(feat_next.unsqueeze(1), noise)
+            bc_act_next = self.bc_policy.predict_action_from_features(
+                sparse_nobs_encode=feat_next, init_noise=noise, unnormalize=False,
+            )["sparse"]
+            next_act = (bc_act_next + delta_next).clamp(-1.0, 1.0)
+
+            q_targets = [ct(feat_next, noise, next_act) for ct in self.critic_targets]
+            q_target  = torch.min(torch.stack(q_targets, dim=-1), dim=-1).values
             td_target = rew + self.gamma * (1 - done) * q_target
 
-        feat = self._encode_obs(obs)
-        noise = torch.randn_like(act.unsqueeze(1).expand(-1, 1, -1))
-        noise = noise[:, 0, :]  # keep (B, action_dim)
-        noise_full = torch.randn(feat.shape[0], self.action_horizon, self.action_dim,
-                                 device=self.device)
+        noise_full = torch.randn(feat.shape[0], self.action_horizon,
+                                 self.action_dim, device=self.device)
         q_preds = [c(feat, noise_full, act) for c in self.critics]
         critic_loss = sum(F.mse_loss(q, td_target) for q in q_preds) / len(self.critics)
 
         self.critic_optim.zero_grad()
         critic_loss.backward()
         nn.utils.clip_grad_norm_(
-            [p for c in self.critics for p in c.parameters()], self.max_grad_norm
-        )
+            [p for c in self.critics for p in c.parameters()], self.max_grad_norm)
         self.critic_optim.step()
         return critic_loss.item()
 
-    def _actor_update(self, batch: dict) -> float:
-        obs, act_expert = batch["obs"], batch["action"]
-        feat = self._encode_obs(obs)
-        noise = torch.randn(
-            feat.shape[0], self.action_horizon, self.action_dim, device=self.device
-        )
-        pred_act = self.actor(feat.unsqueeze(1), noise)  # (B, H, D) normalized
+    def _actor_update_feat(self, feat) -> float:
+        """Actor update using pre-encoded features (no ViT call).
 
-        # Q-maximisation loss
-        q_vals = torch.stack([c(feat, noise, pred_act) for c in self.critics], dim=-1)
-        q_min = q_vals.min(dim=-1).values
-        q_loss = -q_min.mean()
-
-        # BC regularisation: stay close to BC policy's recommended action
+        Residual policy: actor outputs delta. Final action = clamp(BC + delta).
+        Critic evaluates the final action (matches inference).
+        BC loss pulls delta toward zero so the actor stays close to BC unless
+        Q-learning gives a strong signal to deviate.
+        """
+        noise = torch.randn(feat.shape[0], self.action_horizon,
+                            self.action_dim, device=self.device)
+        delta = self.actor(feat.unsqueeze(1), noise)  # (B, H, D) residual
         with torch.no_grad():
             bc_act_n = self.bc_policy.predict_action_from_features(
-                sparse_nobs_encode=feat,
-                init_noise=noise,
-                unnormalize=False,
+                sparse_nobs_encode=feat, init_noise=noise, unnormalize=False,
             )["sparse"]
-        bc_loss = F.mse_loss(pred_act, bc_act_n)
+        final_act = (bc_act_n + delta).clamp(-1.0, 1.0)
+
+        # Q-maximisation on the FULL (clipped) action — same as inference.
+        q_vals = torch.stack([c(feat, noise, final_act) for c in self.critics], dim=-1)
+        q_loss = -q_vals.min(dim=-1).values.mean()
+
+        # Keep the residual small (regularise toward BC by construction).
+        bc_loss = (delta ** 2).mean()
 
         actor_loss = q_loss + self.bc_loss_weight * bc_loss
         self.actor_optim.zero_grad()
@@ -369,7 +465,14 @@ class YAMRLLearner:
         return None
 
     def _push_actor_weights(self) -> None:
-        """Broadcast updated actor weights to env runner via ZMQ."""
+        """Save actor weights to disk for env runner to pick up.
+
+        Uses atomic write (tmp+rename) so env runner never reads a half-written
+        file. Replaces the previous ZMQ-based push which was unreliable.
+        """
+        if not self.rl_checkpoint_dir:
+            return
+        path = os.path.join(self.rl_checkpoint_dir, "latest_actor.pt")
         payload = {
             "actor_state_dict": self.actor.state_dict(),
             "actor_config": {
@@ -377,26 +480,25 @@ class YAMRLLearner:
                 "action_dim": self.action_dim,
                 "cond_steps": 1,
                 "horizon_steps": self.action_horizon,
-                "hidden_dims": list(self.actor.net[0].in_features
-                                    for _ in range(1)),  # approximate
+                "hidden_dims": self._actor_hidden_dims,
             },
             "training_step": self.total_gradient_steps,
         }
-        self.learner_node.network_weight_server.push_data(
-            data=pickle.dumps(payload),
-            topic=self.learner_node.network_weight_topic,
-        )
-        log.info("Pushed actor weights (step %d)", self.total_gradient_steps)
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        log.info("★ Saved latest actor weights to %s (step=%d)",
+                 os.path.basename(path), self.total_gradient_steps)
 
-    def _maybe_resume_checkpoint(self) -> None:
+    def _maybe_resume_checkpoint(self) -> bool:
         if not self.rl_checkpoint_dir:
-            return
+            return False
         ckpts = sorted(glob.glob(os.path.join(self.rl_checkpoint_dir, "checkpoint_*.pt")))
         if not ckpts:
-            return
+            return False
         path = ckpts[-1]
         log.info("Resuming from checkpoint: %s", path)
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(ckpt["actor"])
         for c, sd in zip(self.critics, ckpt["critics"]):
             c.load_state_dict(sd)
@@ -406,6 +508,7 @@ class YAMRLLearner:
         self.total_episodes       = ckpt["total_episodes"]
         log.info("Resumed: total_episodes=%d  total_gradient_steps=%d",
                  self.total_episodes, self.total_gradient_steps)
+        return True
 
     def _save_checkpoint(self) -> None:
         path = os.path.join(

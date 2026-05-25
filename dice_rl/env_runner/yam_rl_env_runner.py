@@ -119,6 +119,7 @@ class YAMRLEnvRunner:
         actor_hidden_dims: list = None,
         # Data & ZMQ
         online_data_dir: str = "/tmp/yam_rl_rollouts",
+        rl_checkpoint_dir: str = None,
         network_server_endpoint: str = "ipc:///tmp/feeds/rl_weights",
         network_weight_topic: str = "rl_network_weights_topic",
         transitions_server_endpoint: str = "ipc:///tmp/feeds/rl_transitions",
@@ -137,6 +138,11 @@ class YAMRLEnvRunner:
                                        dtype=np.float32)
         self.home_gripper_pos = home_gripper_pos
         self.online_data_dir = online_data_dir
+        self.rl_checkpoint_dir = rl_checkpoint_dir
+        self._latest_weights_path = (
+            os.path.join(rl_checkpoint_dir, "latest_actor.pt") if rl_checkpoint_dir else None
+        )
+        self._last_weights_mtime = 0.0
         os.makedirs(online_data_dir, exist_ok=True)
 
         # ---- normalisation ----
@@ -191,6 +197,7 @@ class YAMRLEnvRunner:
         self._abort_episode  = {"flag": False}
         self._in_episode     = False
         self._last_sigint_t  = 0.0   # debounce: ignore rapid duplicate SIGINTs
+        self._actor_step     = 0
         signal.signal(signal.SIGINT,  self._sigint)
         signal.signal(signal.SIGTERM, self._sigterm)
         signal.signal(signal.SIGQUIT, self._sigquit)  # Ctrl-\  → instant kill
@@ -283,10 +290,10 @@ class YAMRLEnvRunner:
                     state_hist.append(q_cur.copy())
                     img_hist.append(img_cur.copy())
 
-            # record (first action of chunk as label)
+            # record full action chunk (H, 7) for critic input
             images_rec.append(img_hist[-1].copy())
             states_rec.append(self.state_norm.normalize(state_hist[-1]))
-            actions_rec.append(self.action_norm.normalize(actions[0]))
+            actions_rec.append(self.action_norm.normalize(actions))  # (H, 7)
 
             log.info("[step %3d] infer=%.1fms  q=%s",
                      step, infer_ms, np.round(self._read_state(), 3).tolist())
@@ -309,7 +316,7 @@ class YAMRLEnvRunner:
             "discard":  False,
             "images":   np.stack(images_rec).astype(np.float32),  # (T,6,H,W) [0,1]
             "states":   np.stack(states_rec).astype(np.float32),  # (T,7) norm
-            "actions":  np.stack(actions_rec).astype(np.float32), # (T,7) norm
+            "actions":  np.stack(actions_rec).astype(np.float32), # (T,H,7) norm
             "rewards":  rewards,
             "dones":    dones,
             "success":  reward_val > 0.5,
@@ -339,8 +346,9 @@ class YAMRLEnvRunner:
         while True:
             # Check for updated actor weights from learner.
             self._try_update_actor()
-
-            input(f"\n[Episode {ep+1}] Press Enter to start, or Ctrl-C to exit.")
+            actor_info = (f"RL actor step={self._actor_step}"
+                         if self.actor is not None else "pure BC")
+            input(f"\n[Episode {ep+1} | {actor_info}] Press Enter to start, or Ctrl-C to exit.")
             ep_data = self.run_episode()
             if ep_data.get("discard"):
                 log.info("Episode discarded.")
@@ -356,8 +364,8 @@ class YAMRLEnvRunner:
                                 rewards=ep_data["rewards"],
                                 dones=ep_data["dones"])
 
-            # Send episode to learner.
-            self.actor_node.send_transitions(pickle.dumps(ep_data))
+            # Send episode to learner (send_transitions pickles internally — do NOT pre-pickle).
+            self.actor_node.send_transitions(ep_data)
             log.info("Episode %d saved+sent (success=%s)", ep+1, ep_data["success"])
             ep += 1
 
@@ -365,12 +373,16 @@ class YAMRLEnvRunner:
             self._move_to_home()
 
     def _try_update_actor(self) -> None:
+        """Pick up the latest actor weights from disk if they're newer than what we have."""
+        if not self._latest_weights_path or not os.path.exists(self._latest_weights_path):
+            return
         try:
-            data, _ = self.actor_node.network_weight_client.pop_data(
-                topic=self.actor_node.network_weight_topic, order="latest", n=1,
-            )
-            if not data: return
-            payload = pickle.loads(data[0])
+            mtime = os.path.getmtime(self._latest_weights_path)
+            if mtime <= self._last_weights_mtime:
+                return  # nothing new
+            # weights_only=False: we wrote this file ourselves and trust the pickle.
+            payload = torch.load(self._latest_weights_path,
+                                 map_location=self.device, weights_only=False)
             cfg = payload["actor_config"]
             if self.actor is None:
                 self.actor = DistilledActor(
@@ -382,9 +394,13 @@ class YAMRLEnvRunner:
                 ).to(self.device)
                 self.actor.eval()
             self.actor.load_state_dict(payload["actor_state_dict"])
-            log.info("Actor weights updated (step=%d)", payload.get("training_step", -1))
+            self._actor_step = payload.get("training_step", -1)
+            self._last_weights_mtime = mtime
+            log.info("★ Actor weights updated (step=%d, %s) — takes effect next episode",
+                     self._actor_step, os.path.basename(self._latest_weights_path))
         except Exception as e:
-            log.debug("Weight update check: %s", e)
+            log.warning("Failed to load actor weights from %s: %s",
+                        self._latest_weights_path, e)
 
     def _sigint(self, *_) -> None:
         now = time.monotonic()
