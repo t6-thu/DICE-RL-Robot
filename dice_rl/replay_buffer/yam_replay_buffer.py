@@ -179,7 +179,7 @@ class YAMReplayBuffer:
             acts.append(np.tile(self._expert_actions[t], (self.action_horizon, 1)))
             rews.append(1.0)   # expert demonstrations treated as success
             dones.append(False)
-        return _pack(obs_list, acts, rews, next_obs_list, dones, dev)
+        return _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert=True)
 
     def _sample_online(self, n: int, dev: torch.device) -> dict:
         online_list = list(self._online)
@@ -189,7 +189,7 @@ class YAMReplayBuffer:
             o, a, r, no, d = online_list[i]
             obs_list.append(o); next_obs_list.append(no)
             acts.append(a); rews.append(r); dones.append(d)
-        return _pack(obs_list, acts, rews, next_obs_list, dones, dev)
+        return _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert=False)
 
     @property
     def num_online_transitions(self) -> int:
@@ -202,7 +202,7 @@ class YAMReplayBuffer:
 
 # ---- helpers ----
 
-def _pack(obs_list, acts, rews, next_obs_list, dones, dev) -> dict:
+def _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert: bool = False) -> dict:
     def _t(x): return torch.from_numpy(np.stack(x)).to(dev, non_blocking=True)
     def _obs(lst):
         return {
@@ -210,12 +210,16 @@ def _pack(obs_list, acts, rews, next_obs_list, dones, dev) -> dict:
             "rgb_1":     _t([o["rgb_1"] for o in lst]),
             "joint_pos": _t([o["joint_pos"] for o in lst]).float(),
         }
+    n = len(obs_list)
     return {
         "obs":      _obs(obs_list),
         "action":   _t(acts).float(),
         "reward":   _t(rews).float().unsqueeze(-1),
         "next_obs": _obs(next_obs_list),
         "done":     torch.tensor(dones, dtype=torch.float32, device=dev).unsqueeze(-1),
+        # 1.0 for expert (BC demos), 0.0 for online (env rollouts).
+        # Used by learner's disable_q_loss_for_expert_data flag.
+        "is_expert": torch.full((n, 1), float(is_expert), dtype=torch.float32, device=dev),
     }
 
 

@@ -80,9 +80,14 @@ class YAMRLLearner:
         tau: float = 0.01,
         actor_lr: float = 1e-4,
         critic_lr: float = 1e-4,
-        bc_loss_weight: float = 100.0,
+        bc_loss_weight: float = 140.0,
         critic_ensemble_size: int = 5,
         max_grad_norm: float = 1.0,
+        # Multi-sample stabilisers (from original DICE-RL-Robot)
+        num_next_noise_samples: int = 4,        # K for target Q averaging
+        num_multi_z_for_actor_loss: int = 8,    # K for actor loss averaging
+        use_q_normalization: bool = True,       # divide q_loss by mean(|Q|)
+        disable_q_loss_for_expert_data: bool = True,  # mask Q-loss on expert samples
         # ZMQ
         network_server_endpoint: str = "ipc:///tmp/feeds/rl_weights",
         network_weight_topic: str = "rl_network_weights_topic",
@@ -104,6 +109,10 @@ class YAMRLLearner:
         self.tau = tau
         self.bc_loss_weight = bc_loss_weight
         self.max_grad_norm = max_grad_norm
+        self.num_next_noise_samples = num_next_noise_samples
+        self.num_multi_z_for_actor_loss = num_multi_z_for_actor_loss
+        self.use_q_normalization = use_q_normalization
+        self.disable_q_loss_for_expert_data = disable_q_loss_for_expert_data
         self.use_rlpd = use_rlpd
         self.expert_ratio = expert_ratio
         self.use_adaptive = use_adaptive_expert_ratio
@@ -302,19 +311,33 @@ class YAMRLLearner:
         self._recent_outcomes.clear()
 
     def _train_round(self) -> None:
-        """Run gradient_steps actor+critic updates with pre-encoded feature pool.
+        """Run gradient_steps updates with pre-encoded feature + multi-K BC pool.
 
-        ViT runs only during pool encoding (2 passes total), not inside the
-        gradient loop — this gives a ~40× speedup over per-step encoding.
+        Pre-computes ONCE per round (matches original loss() exactly but vectorised):
+          - ViT features for obs / next_obs
+          - K_actor=8 (noise, BC) pairs for current_obs  → multi-z actor loss
+          - K_critic=4 (noise, BC) pairs for next_obs    → multi-sample target Q
         """
         er = self._current_expert_ratio()
 
-        # Build feature pool in small mini-batches to stay within GPU memory.
-        pool_size = min(self.gradient_steps * self.batch_size, 10_000)
-        encode_bs = 256
-        log.info("Pre-encoding feature pool (%d transitions, mini-batch=%d)…",
-                 pool_size, encode_bs)
-        feat_list, fnext_list, act_list, rew_list, done_list = [], [], [], [], []
+        pool_size  = min(self.gradient_steps * self.batch_size, 10_000)
+        encode_bs  = 128                                   # smaller because K-expansion below
+        K_actor    = self.num_multi_z_for_actor_loss       # 8
+        K_critic   = self.num_next_noise_samples           # 4
+
+        log.info("Pre-encoding pool (N=%d, K_actor=%d, K_critic=%d, mini-batch=%d)…",
+                 pool_size, K_actor, K_critic, encode_bs)
+        feat_list, fnext_list = [], []
+        noise_K_list, noise_next_K_list = [], []
+        bc_K_list, bc_next_K_list = [], []
+        act_list, rew_list, done_list, is_expert_list = [], [], [], []
+
+        # Reduce BC diffusion steps during RL pool building to match original
+        # rl_num_inference_steps=8 (vs 16 used at deployment). 2× faster pool.
+        _orig_inf_steps = getattr(self.bc_policy, "num_inference_steps", None)
+        if _orig_inf_steps is not None:
+            self.bc_policy.num_inference_steps = 8
+
         n = 0
         while n < pool_size:
             bs = min(encode_bs, pool_size - n)
@@ -322,36 +345,75 @@ class YAMRLLearner:
             if not raw:
                 break
             with torch.no_grad():
-                feat_list.append(self._encode_obs(raw["obs"]))
-                fnext_list.append(self._encode_obs(raw["next_obs"]))
+                feat      = self._encode_obs(raw["obs"])          # (bs, D)
+                feat_next = self._encode_obs(raw["next_obs"])     # (bs, D)
+                # K-expanded noise and BC for current state
+                noise_K = torch.randn(bs, K_actor, self.action_horizon,
+                                      self.action_dim, device=self.device)
+                feat_K  = feat.unsqueeze(1).expand(-1, K_actor, -1).reshape(bs * K_actor, -1)
+                bc_K    = self.bc_policy.predict_action_from_features(
+                    sparse_nobs_encode=feat_K,
+                    init_noise=noise_K.reshape(bs * K_actor, self.action_horizon, self.action_dim),
+                    unnormalize=False,
+                )["sparse"].reshape(bs, K_actor, self.action_horizon, self.action_dim)
+                # K-expanded noise and BC for next state
+                noise_next_K = torch.randn(bs, K_critic, self.action_horizon,
+                                           self.action_dim, device=self.device)
+                feat_next_K  = feat_next.unsqueeze(1).expand(-1, K_critic, -1).reshape(bs * K_critic, -1)
+                bc_next_K    = self.bc_policy.predict_action_from_features(
+                    sparse_nobs_encode=feat_next_K,
+                    init_noise=noise_next_K.reshape(bs * K_critic, self.action_horizon, self.action_dim),
+                    unnormalize=False,
+                )["sparse"].reshape(bs, K_critic, self.action_horizon, self.action_dim)
+            feat_list.append(feat)
+            fnext_list.append(feat_next)
+            noise_K_list.append(noise_K)
+            noise_next_K_list.append(noise_next_K)
+            bc_K_list.append(bc_K)
+            bc_next_K_list.append(bc_next_K)
             act_list.append(raw["action"])
             rew_list.append(raw["reward"])
             done_list.append(raw["done"])
+            is_expert_list.append(raw["is_expert"])
             n += bs
+
+        # Restore BC's inference steps for any downstream use
+        if _orig_inf_steps is not None:
+            self.bc_policy.num_inference_steps = _orig_inf_steps
 
         if not feat_list:
             log.warning("Empty replay buffer — skipping training round")
             return
 
-        pool_feat      = torch.cat(feat_list)   # (N, feat_dim)
-        pool_feat_next = torch.cat(fnext_list)  # (N, feat_dim)
-        pool_act       = torch.cat(act_list)    # (N, H, D)
-        pool_rew       = torch.cat(rew_list)    # (N, 1)
-        pool_done      = torch.cat(done_list)   # (N, 1)
+        pool_feat         = torch.cat(feat_list)            # (N, D)
+        pool_feat_next    = torch.cat(fnext_list)           # (N, D)
+        pool_noise_K      = torch.cat(noise_K_list)         # (N, K_actor, H, D)
+        pool_noise_next_K = torch.cat(noise_next_K_list)    # (N, K_critic, H, D)
+        pool_bc_K         = torch.cat(bc_K_list)            # (N, K_actor, H, D)
+        pool_bc_next_K    = torch.cat(bc_next_K_list)       # (N, K_critic, H, D)
+        pool_act          = torch.cat(act_list)             # (N, H, D)
+        pool_rew          = torch.cat(rew_list)             # (N, 1)
+        pool_done         = torch.cat(done_list)            # (N, 1)
+        pool_is_expert    = torch.cat(is_expert_list)       # (N, 1)
         N = pool_feat.shape[0]
-        log.info("Pool ready (%d features). Running %d MLP-only gradient steps…",
-                 N, self.gradient_steps)
+        log.info("Pool ready. Running %d MLP-only gradient steps…", self.gradient_steps)
 
         for step in range(self.gradient_steps):
             idx = torch.randint(0, N, (self.batch_size,), device=self.device)
-            feat      = pool_feat[idx]
-            feat_next = pool_feat_next[idx]
-            act       = pool_act[idx]
-            rew       = pool_rew[idx]
-            done      = pool_done[idx]
+            feat         = pool_feat[idx]
+            feat_next    = pool_feat_next[idx]
+            noise_K      = pool_noise_K[idx]
+            noise_next_K = pool_noise_next_K[idx]
+            bc_K         = pool_bc_K[idx]
+            bc_next_K    = pool_bc_next_K[idx]
+            act          = pool_act[idx]
+            rew          = pool_rew[idx]
+            done         = pool_done[idx]
+            is_expert    = pool_is_expert[idx]
 
-            c_loss = self._critic_update_feat(feat, act, rew, feat_next, done)
-            a_loss = self._actor_update_feat(feat)
+            c_loss = self._critic_update_feat(
+                feat, act, rew, feat_next, done, noise_next_K, bc_next_K)
+            a_loss = self._actor_update_feat(feat, noise_K, bc_K, is_expert)
             self._update_target_critics()
             self.total_gradient_steps += 1
 
@@ -374,28 +436,34 @@ class YAMRLLearner:
         with torch.no_grad():
             return self.bc_policy.obs_encoder(nobs)
 
-    def _critic_update_feat(self, feat, act, rew, feat_next, done) -> float:
-        """Critic TD update using pre-encoded features (no ViT call).
+    def _critic_update_feat(self, feat, act, rew, feat_next, done,
+                            noise_next_K, bc_next_K) -> float:
+        """Critic TD update — averages target Q over K_critic next-noise samples.
 
-        Residual setup: target action = clamp(BC(s') + actor(s')) so the critic
-        is trained on the same action distribution it will see at inference.
+        Faithful to original distill_rl.loss() with multi_sample_next_noise=True,
+        clip_action=False (no clamp on next_act).
         """
+        B, K = noise_next_K.shape[0], noise_next_K.shape[1]
+        H, D = self.action_horizon, self.action_dim
+
         with torch.no_grad():
-            noise = torch.randn(feat_next.shape[0], self.action_horizon,
-                                self.action_dim, device=self.device)
-            delta_next = self.actor(feat_next.unsqueeze(1), noise)
-            bc_act_next = self.bc_policy.predict_action_from_features(
-                sparse_nobs_encode=feat_next, init_noise=noise, unnormalize=False,
-            )["sparse"]
-            next_act = (bc_act_next + delta_next).clamp(-1.0, 1.0)
+            feat_next_K_flat  = feat_next.unsqueeze(1).expand(-1, K, -1).reshape(B * K, -1)
+            noise_next_K_flat = noise_next_K.reshape(B * K, H, D)
+            bc_next_K_flat    = bc_next_K.reshape(B * K, H, D)
+            delta_next_flat   = self.actor(feat_next_K_flat.unsqueeze(1), noise_next_K_flat)
+            next_act_flat     = bc_next_K_flat + delta_next_flat   # NO clamp (original clip_action=False)
 
-            q_targets = [ct(feat_next, noise, next_act) for ct in self.critic_targets]
-            q_target  = torch.min(torch.stack(q_targets, dim=-1), dim=-1).values
-            td_target = rew + self.gamma * (1 - done) * q_target
+            q_targets = [ct(feat_next_K_flat, noise_next_K_flat, next_act_flat)
+                         for ct in self.critic_targets]
+            q_target_flat = torch.min(torch.stack(q_targets, dim=-1), dim=-1).values  # (B*K, 1)
+            target_next_q = q_target_flat.reshape(B, K, 1).mean(dim=1)                # (B, 1)
+            td_target     = rew + self.gamma * (1 - done) * target_next_q
 
-        noise_full = torch.randn(feat.shape[0], self.action_horizon,
-                                 self.action_dim, device=self.device)
-        q_preds = [c(feat, noise_full, act) for c in self.critics]
+        # Critic prediction on actual transition action. Use a single fresh noise
+        # for the critic's noise input (the critic learns Q(s, z, a); z here is a
+        # conditioning variable that doesn't need to match BC noise for data actions).
+        noise_data = torch.randn(B, H, D, device=self.device)
+        q_preds = [c(feat, noise_data, act) for c in self.critics]
         critic_loss = sum(F.mse_loss(q, td_target) for q in q_preds) / len(self.critics)
 
         self.critic_optim.zero_grad()
@@ -405,29 +473,54 @@ class YAMRLLearner:
         self.critic_optim.step()
         return critic_loss.item()
 
-    def _actor_update_feat(self, feat) -> float:
-        """Actor update using pre-encoded features (no ViT call).
+    def _actor_update_feat(self, feat, noise_K, bc_K, is_expert) -> float:
+        """Actor update — multi-z, q-normalisation, expert-data Q-loss masking.
 
-        Residual policy: actor outputs delta. Final action = clamp(BC + delta).
-        Critic evaluates the final action (matches inference).
-        BC loss pulls delta toward zero so the actor stays close to BC unless
-        Q-learning gives a strong signal to deviate.
+        Faithful to original distill_rl.actor_loss() warmup branch:
+          q_loss   = -mean_k Q(s, BC_k + actor(s, z_k))   (mean over K_actor noises)
+          bc_loss  = mean_k (residual_k ** 2)             (L2 on residual)
+          q_loss  /= mean(|Q|)                             (if use_q_normalization)
+          q_loss   = q_loss masked to online samples       (if disable_q_loss_for_expert_data)
+          loss     = q_loss + bc_loss_weight * bc_loss
         """
-        noise = torch.randn(feat.shape[0], self.action_horizon,
-                            self.action_dim, device=self.device)
-        delta = self.actor(feat.unsqueeze(1), noise)  # (B, H, D) residual
-        with torch.no_grad():
-            bc_act_n = self.bc_policy.predict_action_from_features(
-                sparse_nobs_encode=feat, init_noise=noise, unnormalize=False,
-            )["sparse"]
-        final_act = (bc_act_n + delta).clamp(-1.0, 1.0)
+        B, K = noise_K.shape[0], noise_K.shape[1]
+        H, D = self.action_horizon, self.action_dim
 
-        # Q-maximisation on the FULL (clipped) action — same as inference.
-        q_vals = torch.stack([c(feat, noise, final_act) for c in self.critics], dim=-1)
-        q_loss = -q_vals.min(dim=-1).values.mean()
+        feat_K_flat  = feat.unsqueeze(1).expand(-1, K, -1).reshape(B * K, -1)
+        noise_K_flat = noise_K.reshape(B * K, H, D)
+        bc_K_flat    = bc_K.reshape(B * K, H, D)
 
-        # Keep the residual small (regularise toward BC by construction).
-        bc_loss = (delta ** 2).mean()
+        delta_flat     = self.actor(feat_K_flat.unsqueeze(1), noise_K_flat)
+        final_act_flat = bc_K_flat + delta_flat            # NO clamp (matches original clip_action=False)
+
+        q_vals_flat = torch.stack(
+            [c(feat_K_flat, noise_K_flat, final_act_flat) for c in self.critics], dim=-1
+        )                                                  # (B*K, 1, ensemble)
+        q_min_flat = q_vals_flat.min(dim=-1).values        # (B*K, 1)
+        q_per_K    = q_min_flat.reshape(B, K)              # (B, K)
+        q_per_b    = q_per_K.mean(dim=1)                   # (B,)
+
+        # Mask Q-loss for expert samples
+        online_mask = None
+        if self.disable_q_loss_for_expert_data:
+            online_mask = (1.0 - is_expert.squeeze(-1)).float()   # (B,) 1=online, 0=expert
+            q_per_b = q_per_b * online_mask
+        q_loss = -q_per_b.mean()
+
+        # Normalise q_loss by mean |Q| over the same samples that contributed
+        if self.use_q_normalization:
+            with torch.no_grad():
+                if online_mask is not None:
+                    om_K = online_mask.unsqueeze(-1).expand(-1, K)
+                    cnt  = om_K.sum().clamp_min(1.0)
+                    q_abs_mean = (q_per_K.abs() * om_K).sum() / cnt
+                else:
+                    q_abs_mean = q_per_K.abs().mean()
+            if q_abs_mean > 1e-8:
+                q_loss = q_loss / q_abs_mean
+
+        # BC regularisation: keep residual small (mean of K samples)
+        bc_loss = (delta_flat ** 2).mean()
 
         actor_loss = q_loss + self.bc_loss_weight * bc_loss
         self.actor_optim.zero_grad()

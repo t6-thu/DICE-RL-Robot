@@ -117,6 +117,7 @@ class YAMRLEnvRunner:
         action_dim: int = 7,
         # Actor (residual RL)
         actor_hidden_dims: list = None,
+        residual_scale: float = 1.0,  # scale on actor's delta — set <1 to soften RL effect
         # Data & ZMQ
         online_data_dir: str = "/tmp/yam_rl_rollouts",
         rl_checkpoint_dir: str = None,
@@ -137,6 +138,8 @@ class YAMRLEnvRunner:
         self.home_joint_pos = np.array(home_joint_pos or [-0.01,0.833,0.903,-0.598,-0.028,-0.029],
                                        dtype=np.float32)
         self.home_gripper_pos = home_gripper_pos
+        self.residual_scale = float(residual_scale)
+        self._last_delta_rms = 0.0
         self.online_data_dir = online_data_dir
         self.rl_checkpoint_dir = rl_checkpoint_dir
         self._latest_weights_path = (
@@ -233,10 +236,12 @@ class YAMRLEnvRunner:
         )["sparse"]  # (1, H, 7) normalized
 
         if self.actor is not None:
-            delta = self.actor(features.unsqueeze(1), noise)  # (1, H, 7)
+            delta = self.actor(features.unsqueeze(1), noise) * self.residual_scale
             final_n = (bc_act_n + delta).clamp(-1.0, 1.0)
+            self._last_delta_rms = float(delta.pow(2).mean().sqrt().item())
         else:
             final_n = bc_act_n
+            self._last_delta_rms = 0.0
 
         final_n = final_n[0].cpu().numpy()          # (H, 7) normalized
         final   = self.action_norm.denormalize(final_n)  # (H, 7) i2rt raw
@@ -295,8 +300,9 @@ class YAMRLEnvRunner:
             states_rec.append(self.state_norm.normalize(state_hist[-1]))
             actions_rec.append(self.action_norm.normalize(actions))  # (H, 7)
 
-            log.info("[step %3d] infer=%.1fms  q=%s",
-                     step, infer_ms, np.round(self._read_state(), 3).tolist())
+            log.info("[step %3d] infer=%.1fms  delta_rms=%.3f  q=%s",
+                     step, infer_ms, self._last_delta_rms,
+                     np.round(self._read_state(), 3).tolist())
 
         # ---- user labels success/failure ----
         self._in_episode = False

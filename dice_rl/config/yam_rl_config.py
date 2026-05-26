@@ -114,6 +114,9 @@ RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning")
 # ============================================================
 TRAINING = dict(
     # --- Rollout / training cadence ---
+    # MATCHES ORIGINAL rl_finetuning_config.py (20 warmup, 10-episode block,
+    # 2000 gradient steps per round). DO NOT change these without reason —
+    # the original repo trained successfully with these exact values.
     num_episodes_before_first_training = 20,
     # Collect 20 pure-BC episodes first, then start RL.
 
@@ -141,7 +144,14 @@ TRAINING = dict(
     tau                  = 0.01,     # target critic Polyak rate
     actor_lr             = 1e-4,
     critic_lr            = 1e-4,
-    bc_loss_weight       = 100.0,    # BC regularisation weight on actor
+    bc_loss_weight       = 100.0,   # BC regularisation weight — matches the DICE-RL paper
+                                     # (the repo's rl_finetuning_config.py later drifted to 140 via tuning;
+                                     #  we follow the paper for algorithmic faithfulness)
+    # --- Multi-sample stabilisers (from original) ---
+    num_next_noise_samples       = 4,    # multi_sample_next_noise=True, K=4 (target Q averaging)
+    num_multi_z_for_actor_loss   = 8,    # sample_multi_z_for_actor_loss=True, K=8 (actor loss averaging)
+    use_q_normalization          = True, # divide q_loss by mean(|Q|) for scale stability
+    disable_q_loss_for_expert_data = True,  # only push actor toward Q on online states
     critic_ensemble_size = 5,
     max_grad_norm        = 1.0,
 )
