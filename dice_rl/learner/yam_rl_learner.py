@@ -88,6 +88,9 @@ class YAMRLLearner:
         num_multi_z_for_actor_loss: int = 8,    # K for actor loss averaging
         use_q_normalization: bool = True,       # divide q_loss by mean(|Q|)
         disable_q_loss_for_expert_data: bool = True,  # mask Q-loss on expert samples
+        # BC loss filter (matches original distill_rl.py actor_loss post-warmup branch)
+        use_soft_q_filtering: bool = True,
+        q_filtering_warmup_steps: int = 25000,
         # ZMQ
         network_server_endpoint: str = "ipc:///tmp/feeds/rl_weights",
         network_weight_topic: str = "rl_network_weights_topic",
@@ -113,6 +116,8 @@ class YAMRLLearner:
         self.num_multi_z_for_actor_loss = num_multi_z_for_actor_loss
         self.use_q_normalization = use_q_normalization
         self.disable_q_loss_for_expert_data = disable_q_loss_for_expert_data
+        self.use_soft_q_filtering = use_soft_q_filtering
+        self.q_filtering_warmup_steps = q_filtering_warmup_steps
         self.use_rlpd = use_rlpd
         self.expert_ratio = expert_ratio
         self.use_adaptive = use_adaptive_expert_ratio
@@ -348,8 +353,7 @@ class YAMRLLearner:
                 feat      = self._encode_obs(raw["obs"])          # (bs, D)
                 feat_next = self._encode_obs(raw["next_obs"])     # (bs, D)
                 # K-expanded noise and BC for current state
-                noise_K = torch.randn(bs, K_actor, self.action_horizon,
-                                      self.action_dim, device=self.device)
+                noise_K = torch.randn(bs, K_actor, self.action_horizon, self.action_dim, device=self.device)
                 feat_K  = feat.unsqueeze(1).expand(-1, K_actor, -1).reshape(bs * K_actor, -1)
                 bc_K    = self.bc_policy.predict_action_from_features(
                     sparse_nobs_encode=feat_K,
@@ -474,14 +478,19 @@ class YAMRLLearner:
         return critic_loss.item()
 
     def _actor_update_feat(self, feat, noise_K, bc_K, is_expert) -> float:
-        """Actor update — multi-z, q-normalisation, expert-data Q-loss masking.
+        """Actor update — faithful port of original distill_rl.actor_loss().
 
-        Faithful to original distill_rl.actor_loss() warmup branch:
-          q_loss   = -mean_k Q(s, BC_k + actor(s, z_k))   (mean over K_actor noises)
-          bc_loss  = mean_k (residual_k ** 2)             (L2 on residual)
-          q_loss  /= mean(|Q|)                             (if use_q_normalization)
-          q_loss   = q_loss masked to online samples       (if disable_q_loss_for_expert_data)
-          loss     = q_loss + bc_loss_weight * bc_loss
+        Warmup phase (training_step <= q_filtering_warmup_steps):
+          - simple Q + BC loss, no filter
+        Post-warmup phase:
+          - Compute Q(s, a_actor) and Q(s, a_BC) per K-sample
+          - bc_filter = 1 - I[Q_actor > Q_BC]   (codebase fallback, q_overestimation=None)
+          - BC loss = mean over K of bc_filter * ||residual||^2
+          - This is the "DICE-RL" mechanism: stop pulling actor back to BC
+            once its action is clearly value-improving.
+        Both phases apply:
+          - q_normalisation (q_loss /= mean(|Q|))
+          - disable_q_loss_for_expert_data mask
         """
         B, K = noise_K.shape[0], noise_K.shape[1]
         H, D = self.action_horizon, self.action_dim
@@ -490,37 +499,54 @@ class YAMRLLearner:
         noise_K_flat = noise_K.reshape(B * K, H, D)
         bc_K_flat    = bc_K.reshape(B * K, H, D)
 
+        # actor action (with grads)
         delta_flat     = self.actor(feat_K_flat.unsqueeze(1), noise_K_flat)
-        final_act_flat = bc_K_flat + delta_flat            # NO clamp (matches original clip_action=False)
+        final_act_flat = bc_K_flat + delta_flat                # NO clamp (matches codebase clip_action=False)
 
-        q_vals_flat = torch.stack(
+        # Q(s, a_actor) with grads (for the Q-maximisation loss)
+        q_actor_flat = torch.stack(
             [c(feat_K_flat, noise_K_flat, final_act_flat) for c in self.critics], dim=-1
-        )                                                  # (B*K, 1, ensemble)
-        q_min_flat = q_vals_flat.min(dim=-1).values        # (B*K, 1)
-        q_per_K    = q_min_flat.reshape(B, K)              # (B, K)
-        q_per_b    = q_per_K.mean(dim=1)                   # (B,)
+        )                                                      # (B*K, 1, ensemble)
+        q_actor_min_flat = q_actor_flat.min(dim=-1).values     # (B*K, 1)
+        q_actor_per_K    = q_actor_min_flat.reshape(B, K)      # (B, K)
 
-        # Mask Q-loss for expert samples
+        # ---- Q-loss ----
+        q_per_b = q_actor_per_K.mean(dim=1)                    # (B,)
         online_mask = None
         if self.disable_q_loss_for_expert_data:
-            online_mask = (1.0 - is_expert.squeeze(-1)).float()   # (B,) 1=online, 0=expert
+            online_mask = (1.0 - is_expert.squeeze(-1)).float()  # (B,)
             q_per_b = q_per_b * online_mask
         q_loss = -q_per_b.mean()
-
-        # Normalise q_loss by mean |Q| over the same samples that contributed
         if self.use_q_normalization:
             with torch.no_grad():
                 if online_mask is not None:
                     om_K = online_mask.unsqueeze(-1).expand(-1, K)
                     cnt  = om_K.sum().clamp_min(1.0)
-                    q_abs_mean = (q_per_K.abs() * om_K).sum() / cnt
+                    q_abs_mean = (q_actor_per_K.abs() * om_K).sum() / cnt
                 else:
-                    q_abs_mean = q_per_K.abs().mean()
+                    q_abs_mean = q_actor_per_K.abs().mean()
             if q_abs_mean > 1e-8:
                 q_loss = q_loss / q_abs_mean
 
-        # BC regularisation: keep residual small (mean of K samples)
-        bc_loss = (delta_flat ** 2).mean()
+        # ---- BC loss (with optional soft Q filter) ----
+        # MSE-per-sample over (horizon, action_dim): (B, K)
+        residual = delta_flat.reshape(B, K, H, D)
+        mse_per_sample = (residual ** 2).mean(dim=(2, 3))        # (B, K)
+
+        in_warmup = self.total_gradient_steps <= self.q_filtering_warmup_steps
+        if (not in_warmup) and self.use_soft_q_filtering:
+            with torch.no_grad():
+                # Q(s, a_BC) — Q evaluated at the unmodified BC action
+                q_bc_flat = torch.stack(
+                    [c(feat_K_flat, noise_K_flat, bc_K_flat) for c in self.critics], dim=-1
+                )
+                q_bc_min_flat = q_bc_flat.min(dim=-1).values    # (B*K, 1)
+                q_bc_per_K = q_bc_min_flat.reshape(B, K)        # (B, K)
+                better_than_bc = (q_actor_per_K > q_bc_per_K).float()  # (B, K)
+                bc_filter_expanded = 1.0 - better_than_bc       # (B, K)
+            bc_loss = (bc_filter_expanded * mse_per_sample).mean()
+        else:
+            bc_loss = mse_per_sample.mean()                     # plain mean (warmup behaviour)
 
         actor_loss = q_loss + self.bc_loss_weight * bc_loss
         self.actor_optim.zero_grad()

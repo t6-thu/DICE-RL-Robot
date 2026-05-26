@@ -106,8 +106,8 @@ EXPERT_NPZ = os.path.join(_data_dir,
                           "yam_picknplace_arizonabottle_224", "train.npz")
 NORM_NPZ   = os.path.join(_data_dir,
                           "yam_picknplace_arizonabottle_224", "normalization.npz")
-ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts")
-RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning")
+ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts_v2")
+RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning_v2")
 
 # ============================================================
 # Training algorithm settings
@@ -144,14 +144,18 @@ TRAINING = dict(
     tau                  = 0.01,     # target critic Polyak rate
     actor_lr             = 1e-4,
     critic_lr            = 1e-4,
-    bc_loss_weight       = 100.0,   # BC regularisation weight — matches the DICE-RL paper
-                                     # (the repo's rl_finetuning_config.py later drifted to 140 via tuning;
-                                     #  we follow the paper for algorithmic faithfulness)
+    bc_loss_weight       = 100.0,   # BC regularisation weight — matches the original codebase
+                                     # (rl_finetuning_config.py model_para["bc_loss_weight"]=140).
+                                     # The paper's appendix table reports 100, but real-robot tuning
+                                     # in the codebase converged to 140.
     # --- Multi-sample stabilisers (from original) ---
     num_next_noise_samples       = 4,    # multi_sample_next_noise=True, K=4 (target Q averaging)
     num_multi_z_for_actor_loss   = 8,    # sample_multi_z_for_actor_loss=True, K=8 (actor loss averaging)
     use_q_normalization          = True, # divide q_loss by mean(|Q|) for scale stability
     disable_q_loss_for_expert_data = True,  # only push actor toward Q on online states
+    # --- BC loss filter (DICE-RL's core innovation; codebase default = active) ---
+    use_soft_q_filtering         = True, # turn on the BC filter after warmup
+    q_filtering_warmup_steps     = 25000, # use simple Q+BC for first N steps (codebase default)
     critic_ensemble_size = 5,
     max_grad_norm        = 1.0,
 )
