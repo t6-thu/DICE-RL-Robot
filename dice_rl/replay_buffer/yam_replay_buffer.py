@@ -44,11 +44,21 @@ class YAMReplayBuffer:
         action_horizon: int = 16,
         max_online_size: int = 50_000,
         device: str = "cuda",
+        hire_shaper=None,
+        use_sparse_for_online_success: bool = False,
     ) -> None:
         self.obs_horizon = obs_horizon
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.device = torch.device(device)
+        # Optional HiRE reward shaper: if provided and `is_ready()` is True,
+        # episodes' sparse rewards get PBRS dense shaping applied at insertion.
+        self.hire_shaper = hire_shaper
+        # Switch: when True, batches sampled from online SUCCESS episodes use the
+        # original sparse reward instead of the HiRE-shaped one. Online failure
+        # episodes always use the shaped reward; offline expert always uses
+        # sparse (= 1.0 per `_sample_expert`).
+        self.use_sparse_for_online_success = bool(use_sparse_for_online_success)
 
         # ---- expert buffer (preloaded from BC training npz) ----
         log.info("Loading expert data from %s", expert_npz_path)
@@ -107,11 +117,23 @@ class YAMReplayBuffer:
         """
         S = episode["states"]
         A = episode["actions"]
-        R = episode["rewards"]
+        R_sparse = np.asarray(episode["rewards"], dtype=np.float32)
         D = episode["dones"]
         I = episode["images"]
         T = len(S)
         ep_start = 0
+
+        # Episode-level success flag (used at sample time for the
+        # `use_sparse_for_online_success` switch).
+        success = bool(R_sparse[-1] > 0.5) if len(R_sparse) > 0 else False
+
+        # HiRE PBRS shaping: r_t_shaped = r_t_sparse + γ·Φ(s_{t+1}) − Φ(s_t)
+        # We store BOTH sparse and shaped per transition so sample time can
+        # pick between them via the switch.
+        if self.hire_shaper is not None and self.hire_shaper.is_ready():
+            R_shaped = self.hire_shaper.shape_rewards(R_sparse, I)
+        else:
+            R_shaped = R_sparse.copy()
 
         for t in range(T - 1):
             obs      = self._make_obs(I, S, t,   ep_start)
@@ -119,7 +141,10 @@ class YAMReplayBuffer:
             a = A[t]
             if a.ndim == 1:  # single action (7,) → tile to (H, 7)
                 a = np.tile(a, (self.action_horizon, 1))
-            self._online.append((obs, a, R[t], next_obs, D[t]))
+            # Tuple format: (obs, action, r_shaped, r_sparse, is_success, next_obs, done)
+            self._online.append((obs, a,
+                                 float(R_shaped[t]), float(R_sparse[t]),
+                                 success, next_obs, D[t]))
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
@@ -186,7 +211,14 @@ class YAMReplayBuffer:
         idxs = np.random.randint(0, len(online_list), n)
         obs_list, next_obs_list, acts, rews, dones = [], [], [], [], []
         for i in idxs:
-            o, a, r, no, d = online_list[i]
+            o, a, r_shaped, r_sparse, is_success, no, d = online_list[i]
+            # Online-success switch: when ON, success transitions revert to the
+            # sparse reward (matches offline expert's sparse-style supervision).
+            # Online failures always use the HiRE-shaped reward.
+            if self.use_sparse_for_online_success and is_success:
+                r = r_sparse
+            else:
+                r = r_shaped
             obs_list.append(o); next_obs_list.append(no)
             acts.append(a); rews.append(r); dones.append(d)
         return _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert=False)

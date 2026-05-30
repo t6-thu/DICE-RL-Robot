@@ -106,8 +106,15 @@ EXPERT_NPZ = os.path.join(_data_dir,
                           "yam_picknplace_arizonabottle_224", "train.npz")
 NORM_NPZ   = os.path.join(_data_dir,
                           "yam_picknplace_arizonabottle_224", "normalization.npz")
-ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts_v2")
-RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning_v2")
+ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts_hire")
+RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning_hire")
+
+# Past-run directory used ONLY to seed the HiRE positive/negative buffers.
+# These episodes are NOT loaded into the replay buffer for training — only
+# their last few frames are encoded into DINOv2 features and added to the
+# pos (success) / neg (failure) buffers so the reward shaper has signal
+# from step 0. New episodes go into ONLINE_DATA_DIR (above) as usual.
+HIRE_INIT_DIR   = os.path.join(_data_dir, "yam_rl_rollouts_v2")
 
 # ============================================================
 # Training algorithm settings
@@ -156,6 +163,37 @@ TRAINING = dict(
     # --- BC loss filter (DICE-RL's core innovation; codebase default = active) ---
     use_soft_q_filtering         = True, # turn on the BC filter after warmup
     q_filtering_warmup_steps     = 25000, # use simple Q+BC for first N steps (codebase default)
+    # --- HiRE (Hindsight Reward Editing): contrastive_prompt + PBRS dense reward ---
+    # When enabled, each transition's reward becomes:
+    #     r_t = r_sparse_t + γ·Φ(s_{t+1}) − Φ(s_t)
+    # with Φ(s) = reward_weight · ( sim_pos(s) − contrastive_lambda · sim_neg(s) )
+    # computed via DINOv2 ViT-S/14 patch features over base + wrist cameras.
+    #
+    # Positive buffer  : ALL frames of offline expert demos (strided) AND
+    #                    ALL frames of online success episodes.
+    # Negative buffer  : LAST FRAME ONLY of online failure episodes.
+    # The two buffers use *different* logsumexp temperatures so that positives
+    # behave like a sharp max (β_pos=10, "is this close to any successful state?")
+    # and negatives behave like a smooth mean (β_neg=1, "is this generally
+    # similar to failure modes?"). Combined with a small contrastive λ=0.1,
+    # this lets positives drive most of the signal while negatives gently push
+    # the policy away from common failure patterns.
+    use_hire_reward                = True,
+    hire_reward_weight             = 1.0,    # scales Φ
+    hire_contrastive_lambda        = 0.1,    # weight on neg sim subtraction (was 1.0)
+    hire_logsumexp_beta_pos        = 10.0,   # SHARP max over positives
+    hire_logsumexp_beta_neg        = 1.0,    # SMOOTH ≈ mean over negatives
+    hire_gamma_pbrs                = 0.99,   # discount inside PBRS shaping
+    hire_sample_K                  = 64,     # K samples drawn from each buffer
+    hire_online_success_frames     = "all",  # all frames of online success → positive
+    hire_online_failure_frames     = 1,      # last 1 frame of online failure → negative
+    hire_expert_frame_stride       = 5,      # subsample offline expert frames (stride)
+    hire_max_buffer_size           = 4096,   # cap buffer size to bound GPU memory
+
+    # Reward-recipe switch:
+    #   False (default) → online success uses HiRE-shaped reward (full method)
+    #   True            → online success reverts to sparse reward, like offline
+    use_sparse_for_online_success  = True,
     critic_ensemble_size = 5,
     max_grad_norm        = 1.0,
 )

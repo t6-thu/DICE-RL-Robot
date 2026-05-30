@@ -91,6 +91,23 @@ class YAMRLLearner:
         # BC loss filter (matches original distill_rl.py actor_loss post-warmup branch)
         use_soft_q_filtering: bool = True,
         q_filtering_warmup_steps: int = 25000,
+        # HiRE — Hindsight Reward Editing (contrastive + PBRS dense reward)
+        use_hire_reward: bool = False,
+        hire_init_dir: str = None,                # past online episodes to seed pos/neg
+        hire_reward_weight: float = 1.0,
+        hire_contrastive_lambda: float = 0.1,
+        hire_logsumexp_beta_pos: float = 10.0,    # sharp max for positive (goal-like)
+        hire_logsumexp_beta_neg: float = 1.0,     # smooth max ≈ mean for negative
+        hire_gamma_pbrs: float = 0.99,
+        hire_sample_K: int = 64,
+        hire_online_success_frames="all",         # paper: all frames of online success
+        hire_online_failure_frames: int = 1,      # paper: last frame of online failure
+        hire_expert_frame_stride: int = 5,        # subsample offline expert
+        hire_max_buffer_size: int = 4096,
+        # Reward-recipe switch:
+        #   False (default) — online success uses HiRE shaped reward (full method)
+        #   True            — online success reverts to sparse reward (offline-style)
+        use_sparse_for_online_success: bool = False,
         # ZMQ
         network_server_endpoint: str = "ipc:///tmp/feeds/rl_weights",
         network_weight_topic: str = "rl_network_weights_topic",
@@ -179,6 +196,40 @@ class YAMRLLearner:
             [p for c in self.critics for p in c.parameters()], lr=critic_lr
         )
 
+        # ---- HiRE reward shaper (optional) ----
+        self.use_hire_reward = use_hire_reward
+        self.use_sparse_for_online_success = use_sparse_for_online_success
+        self.hire_shaper = None
+        if self.use_hire_reward:
+            from dice_rl.reward.hire_shaper import DinoV2Encoder, HireRewardShaper
+            log.info("HiRE enabled — building DINOv2 encoder + contrastive PBRS shaper")
+            _dino = DinoV2Encoder(device=device)
+            self.hire_shaper = HireRewardShaper(
+                encoder=_dino,
+                cameras=("base", "wrist"),
+                reward_weight=hire_reward_weight,
+                contrastive_lambda=hire_contrastive_lambda,
+                logsumexp_beta_pos=hire_logsumexp_beta_pos,
+                logsumexp_beta_neg=hire_logsumexp_beta_neg,
+                gamma_pbrs=hire_gamma_pbrs,
+                sample_K=hire_sample_K,
+                online_success_frames=hire_online_success_frames,
+                online_failure_frames=hire_online_failure_frames,
+                expert_frame_stride=hire_expert_frame_stride,
+                max_buffer_size=hire_max_buffer_size,
+            )
+            # 1) Positive buffer ← ALL (strided) frames of offline expert demos
+            self.hire_shaper.build_from_expert_npz(expert_npz_path)
+            # 2) Positive ← all frames of past online SUCCESS; Negative ← last
+            #    frame of past online FAILURE — from the seed directory.
+            seed_dir = hire_init_dir or online_data_dir
+            self.hire_shaper.build_initial_buffers_from_dir(seed_dir)
+            # Also seed from the current online_data_dir if different (resume case).
+            if (hire_init_dir is not None) and (online_data_dir != hire_init_dir):
+                self.hire_shaper.build_initial_buffers_from_dir(online_data_dir)
+            log.info("HiRE reward-recipe switch: use_sparse_for_online_success=%s",
+                     self.use_sparse_for_online_success)
+
         # ---- replay buffer ----
         self.replay_buffer = YAMReplayBuffer(
             expert_npz_path=expert_npz_path,
@@ -187,6 +238,8 @@ class YAMRLLearner:
             action_dim=action_dim,
             action_horizon=action_horizon,
             device=device,
+            hire_shaper=self.hire_shaper,
+            use_sparse_for_online_success=self.use_sparse_for_online_success,
         )
 
         # ---- ZMQ communication ----
@@ -297,6 +350,12 @@ class YAMRLLearner:
                      "SUCCESS" if success else "FAILURE",
                      os.path.basename(p),
                      self.replay_buffer.num_online_transitions)
+            # Grow the HiRE buffer with the *new* episode's last frames
+            # (positive if successful, negative if failed). Done AFTER
+            # add_episode so the new episode's own shaping uses the
+            # buffer state from before this addition.
+            if self.hire_shaper is not None and "images" in ep_data:
+                self.hire_shaper.add_episode_to_buffer(ep_data["images"], success)
             self._loaded_disk_files.add(p)
             loaded_count += 1
         return loaded_count
