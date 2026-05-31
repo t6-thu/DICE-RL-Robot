@@ -103,7 +103,8 @@ class YAMRLLearner:
         hire_online_success_frames="all",         # paper: all frames of online success
         hire_online_failure_frames: int = 1,      # paper: last frame of online failure
         hire_expert_frame_stride: int = 5,        # subsample offline expert
-        hire_max_buffer_size: int = 4096,
+        hire_max_pos_buffer_size: int = 4096,          # positive FIFO (offline + online share)
+        hire_max_neg_buffer_size: int = 10,            # most-recent online failures (FIFO)
         # Reward-recipe switch:
         #   False (default) — online success uses HiRE shaped reward (full method)
         #   True            — online success reverts to sparse reward (offline-style)
@@ -216,16 +217,23 @@ class YAMRLLearner:
                 online_success_frames=hire_online_success_frames,
                 online_failure_frames=hire_online_failure_frames,
                 expert_frame_stride=hire_expert_frame_stride,
-                max_buffer_size=hire_max_buffer_size,
+                max_pos_buffer_size=hire_max_pos_buffer_size,
+                max_neg_buffer_size=hire_max_neg_buffer_size,
             )
-            # 1) Positive buffer ← ALL (strided) frames of offline expert demos
+            # 1) Positive buffer ← ALL (strided) frames of offline expert demos.
+            #    This is the only seeding HiRE always does — it gives the
+            #    shaper "ideal goal-state" reference embeddings before any
+            #    online interaction has happened.
             self.hire_shaper.build_from_expert_npz(expert_npz_path)
-            # 2) Positive ← all frames of past online SUCCESS; Negative ← last
-            #    frame of past online FAILURE — from the seed directory.
-            seed_dir = hire_init_dir or online_data_dir
-            self.hire_shaper.build_initial_buffers_from_dir(seed_dir)
-            # Also seed from the current online_data_dir if different (resume case).
-            if (hire_init_dir is not None) and (online_data_dir != hire_init_dir):
+            # 2) Optionally seed pos/neg from a past-run directory of online
+            #    episodes (e.g. a previous HiRE checkpoint to resume from).
+            #    Skipped when `hire_init_dir is None` so HiRE training starts
+            #    from a clean slate, matching the baseline's fresh start.
+            if hire_init_dir is not None:
+                self.hire_shaper.build_initial_buffers_from_dir(hire_init_dir)
+            # 3) Always also scan the current ONLINE_DATA_DIR so a resumed run
+            #    picks up its own previously-collected episodes (no-op if empty).
+            if (hire_init_dir is None) or (online_data_dir != hire_init_dir):
                 self.hire_shaper.build_initial_buffers_from_dir(online_data_dir)
             log.info("HiRE reward-recipe switch: use_sparse_for_online_success=%s",
                      self.use_sparse_for_online_success)

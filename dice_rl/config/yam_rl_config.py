@@ -110,11 +110,14 @@ ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts_hire")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning_hire")
 
 # Past-run directory used ONLY to seed the HiRE positive/negative buffers.
-# These episodes are NOT loaded into the replay buffer for training — only
-# their last few frames are encoded into DINOv2 features and added to the
-# pos (success) / neg (failure) buffers so the reward shaper has signal
-# from step 0. New episodes go into ONLINE_DATA_DIR (above) as usual.
-HIRE_INIT_DIR   = os.path.join(_data_dir, "yam_rl_rollouts_v2")
+# Set to None to start HiRE training from scratch (no online data seed) —
+# the positive buffer is still seeded by the offline expert (train.npz) and
+# the negative buffer starts empty (fills up as new online failures arrive).
+# (We previously pointed this at `yam_rl_rollouts_v2` but that was a
+# different *baseline* run, so we don't want its episodes to bias our HiRE
+# experiment. Fair comparison: HiRE starts with 0 online episodes, just
+# like the baseline did.)
+HIRE_INIT_DIR   = None
 
 # ============================================================
 # Training algorithm settings
@@ -188,7 +191,13 @@ TRAINING = dict(
     hire_online_success_frames     = "all",  # all frames of online success → positive
     hire_online_failure_frames     = 1,      # last 1 frame of online failure → negative
     hire_expert_frame_stride       = 5,      # subsample offline expert frames (stride)
-    hire_max_buffer_size           = 4096,   # cap buffer size to bound GPU memory
+    # FIFO caps per camera:
+    #   pos_buffer (cap=4096): seeded by offline expert; online success frames
+    #     get appended over time and gradually push out older expert frames.
+    #   neg_buffer (cap=10): only the most-recent online failure end-frames —
+    #     small on purpose so the policy adapts to its current failure modes.
+    hire_max_pos_buffer_size       = 4096,
+    hire_max_neg_buffer_size       = 20,
 
     # Reward-recipe switch:
     #   False (default) → online success uses HiRE-shaped reward (full method)

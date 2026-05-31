@@ -109,11 +109,13 @@ class HireRewardShaper:
         logsumexp_beta_neg: float = 1.0,    # smooth max ≈ mean for negatives
         gamma_pbrs: float = 0.99,
         sample_K: int = 64,
-        # Frame-selection rules (replace the old `frames_per_episode_for_buffer`):
+        # Frame-selection rules:
         online_success_frames="all",        # "all" or an int — frames per online success
         online_failure_frames: int = 1,     # last N frames per online failure (paper: 1)
         expert_frame_stride: int = 5,       # sub-sample offline expert (every Nth frame)
-        max_buffer_size: int = 4096,
+        # Two independent FIFO caps per camera (pos shared between offline + online):
+        max_pos_buffer_size: int = 4096,    # positive buffer: offline expert + online success FIFO
+        max_neg_buffer_size: int = 10,      # negative buffer: recent online failures (small FIFO)
         encode_batch_size: int = 32,
     ) -> None:
         self.encoder = encoder
@@ -128,9 +130,15 @@ class HireRewardShaper:
         self.online_success_frames = online_success_frames   # "all" or int
         self.online_failure_frames = int(online_failure_frames)
         self.expert_frame_stride   = max(1, int(expert_frame_stride))
-        self.max_buffer_size    = int(max_buffer_size)
-        self.encode_batch_size  = int(encode_batch_size)
+        self.max_pos_buffer_size   = int(max_pos_buffer_size)
+        self.max_neg_buffer_size   = int(max_neg_buffer_size)
+        self.encode_batch_size     = int(encode_batch_size)
 
+        # Per-camera FIFO buffers.
+        # pos_buffer holds both offline-expert frames (built once at init) and
+        # online-success frames (appended as episodes come in). Cap is shared:
+        # newer online success frames eventually push out the oldest expert
+        # frames via FIFO.
         self.pos_buffer: Dict[str, torch.Tensor] = {}
         self.neg_buffer: Dict[str, torch.Tensor] = {}
 
@@ -139,32 +147,26 @@ class HireRewardShaper:
     # ------------------------------------------------------------------
 
     def is_ready(self) -> bool:
-        """True iff at least one camera has at least one of pos or neg embeddings.
-
-        With the new buffer recipe, the positive buffer is filled from offline
-        expert (always available) while the negative buffer only fills as online
-        failures accumulate. We allow HiRE to operate as soon as either side
-        has something — the missing side contributes 0 in `_sim_to_targets`.
-        """
+        """True iff at least one camera has any embeddings in pos or neg buffer."""
         for cam in self.cameras:
-            pos = self.pos_buffer.get(cam)
-            neg = self.neg_buffer.get(cam)
-            if (pos is not None and pos.numel() > 0) or \
-               (neg is not None and neg.numel() > 0):
-                return True
+            for buf in (self.pos_buffer, self.neg_buffer):
+                t = buf.get(cam)
+                if t is not None and t.numel() > 0:
+                    return True
         return False
 
     @torch.no_grad()
     def _append_to_buffer(self, buf: Dict[str, torch.Tensor],
-                          camera: str, feats_NPD: torch.Tensor) -> None:
+                          camera: str, feats_NPD: torch.Tensor,
+                          cap: int) -> None:
+        """FIFO append into `buf[camera]` and truncate to keep at most `cap` entries."""
         feats_NPD = feats_NPD.detach().to(self.device)
         if camera in buf and buf[camera].numel() > 0:
             buf[camera] = torch.cat([buf[camera], feats_NPD], dim=0)
         else:
             buf[camera] = feats_NPD
-        # Cap buffer size by keeping the most recent embeddings.
-        if buf[camera].shape[0] > self.max_buffer_size:
-            buf[camera] = buf[camera][-self.max_buffer_size:]
+        if buf[camera].shape[0] > cap:
+            buf[camera] = buf[camera][-cap:]
 
     @torch.no_grad()
     def _encode_episode_frames(self, images_T6HW_f01: np.ndarray,
@@ -188,28 +190,31 @@ class HireRewardShaper:
 
     @torch.no_grad()
     def add_episode_to_buffer(self, images_T6HW_f01: np.ndarray, success: bool) -> int:
-        """Add frames from one online episode to pos (if success) or neg (if failure).
+        """Add frames from one online episode.
 
-        * success  → uses `online_success_frames` ("all" or int)  → positive buffer
-        * failure  → uses `online_failure_frames` (default 1)     → negative buffer
-        Returns the number of frames added.
+        * success → `online_success_frames` frames appended to POSITIVE buffer
+                    (FIFO with cap=`max_pos_buffer_size`; will gradually push out
+                    the oldest entries, including offline expert seeds).
+        * failure → `online_failure_frames` frames appended to NEGATIVE buffer
+                    (FIFO with cap=`max_neg_buffer_size`, small by design).
         """
         T = int(images_T6HW_f01.shape[0])
         if T == 0:
             return 0
         if success:
-            if self.online_success_frames == "all":
-                n = T
-            else:
-                n = min(int(self.online_success_frames), T)
+            n = T if self.online_success_frames == "all" \
+                  else min(int(self.online_success_frames), T)
+            target_buf = self.pos_buffer
+            cap        = self.max_pos_buffer_size
         else:
             n = min(int(self.online_failure_frames), T)
+            target_buf = self.neg_buffer
+            cap        = self.max_neg_buffer_size
         frame_idx = np.arange(T - n, T, dtype=np.int64)
         feats_base, feats_wrist = self._encode_episode_frames(
             images_T6HW_f01, frame_idx)
-        buf = self.pos_buffer if success else self.neg_buffer
-        self._append_to_buffer(buf, "base",  feats_base)
-        self._append_to_buffer(buf, "wrist", feats_wrist)
+        self._append_to_buffer(target_buf, "base",  feats_base,  cap=cap)
+        self._append_to_buffer(target_buf, "wrist", feats_wrist, cap=cap)
         return n
 
     @torch.no_grad()
@@ -236,11 +241,12 @@ class HireRewardShaper:
 
         T_total = int(images.shape[0])
         indices = np.arange(0, T_total, self.expert_frame_stride)
-        if len(indices) > self.max_buffer_size:
+        cap = self.max_pos_buffer_size
+        if len(indices) > cap:
             rng = np.random.default_rng(0)
-            indices = np.sort(rng.choice(indices, self.max_buffer_size, replace=False))
-        log.info("HiRE: encoding %d offline-expert frames (of %d total, stride=%d)…",
-                 len(indices), T_total, self.expert_frame_stride)
+            indices = np.sort(rng.choice(indices, cap, replace=False))
+        log.info("HiRE: encoding %d offline-expert frames (of %d total, stride=%d) → pos_buffer (cap=%d)…",
+                 len(indices), T_total, self.expert_frame_stride, cap)
 
         added = 0
         bs = self.encode_batch_size
@@ -253,20 +259,25 @@ class HireRewardShaper:
                 sel = sel.astype(np.float32)
             base  = torch.from_numpy(sel[:, :3])
             wrist = torch.from_numpy(sel[:, 3:])
-            self._append_to_buffer(self.pos_buffer, "base",  self.encoder.encode(base))
-            self._append_to_buffer(self.pos_buffer, "wrist", self.encoder.encode(wrist))
+            self._append_to_buffer(self.pos_buffer, "base",
+                                   self.encoder.encode(base),  cap=cap)
+            self._append_to_buffer(self.pos_buffer, "wrist",
+                                   self.encoder.encode(wrist), cap=cap)
             added += sel.shape[0]
-        log.info("HiRE: positive buffer after expert: %s",
-                 {c: tuple(self.pos_buffer[c].shape) for c in self.cameras
-                  if c in self.pos_buffer})
+        log.info("HiRE: pos_buffer after expert: %s",
+                 {c: tuple(self.pos_buffer[c].shape)
+                  for c in self.cameras if c in self.pos_buffer})
         return added
 
     @torch.no_grad()
     def build_initial_buffers_from_dir(self, episode_dir: str) -> None:
-        """Scan all `episode_*.npz` under `episode_dir`, populate both buffers."""
+        """Scan all `episode_*.npz` under `episode_dir`, append to pos/neg buffers."""
+        if not episode_dir or not os.path.isdir(episode_dir):
+            log.info("HiRE: no online-episode seed dir at %s — skipping", episode_dir)
+            return
         paths = sorted(glob.glob(os.path.join(episode_dir, "episode_*.npz")))
         if not paths:
-            log.warning("HiRE: no episodes under %s — buffers stay empty", episode_dir)
+            log.info("HiRE: no episodes under %s — buffers stay empty for now", episode_dir)
             return
         log.info("HiRE: building positive/negative buffers from %d episodes in %s …",
                  len(paths), episode_dir)
@@ -281,10 +292,10 @@ class HireRewardShaper:
                 n_pos_ep += 1; n_pos_f += added
             else:
                 n_neg_ep += 1; n_neg_f += added
-        log.info("HiRE: positive buffer  = %d frames from %d success episodes",
-                 n_pos_f, n_pos_ep)
-        log.info("HiRE: negative buffer  = %d frames from %d failure episodes",
-                 n_neg_f, n_neg_ep)
+        log.info("HiRE: pos_buffer += %d frames from %d success episodes (FIFO cap=%d)",
+                 n_pos_f, n_pos_ep, self.max_pos_buffer_size)
+        log.info("HiRE: neg_buffer += %d frames from %d failure episodes (FIFO cap=%d)",
+                 n_neg_f, n_neg_ep, self.max_neg_buffer_size)
         for cam in self.cameras:
             pos = self.pos_buffer.get(cam)
             neg = self.neg_buffer.get(cam)
@@ -337,8 +348,8 @@ class HireRewardShaper:
         f_wrist = self.encoder.encode(wrist)
 
         sim_total = torch.zeros(T, device=self.device)
-        # Re-sample K from buffer once per episode (paper does so per step but
-        # per-episode sampling is much faster and statistically similar).
+        # Re-sample K from each buffer once per episode (paper does so per step
+        # but per-episode sampling is much faster and statistically similar).
         pos_b = self._sample_buffer(self.pos_buffer.get("base"))
         neg_b = self._sample_buffer(self.neg_buffer.get("base"))
         pos_w = self._sample_buffer(self.pos_buffer.get("wrist"))
