@@ -196,9 +196,9 @@ TRAINING = dict(
     # the policy away from common failure patterns.
     use_hire_reward                = True,
     hire_reward_weight             = 1.0,    # scales Φ
-    hire_contrastive_lambda        = 0.1,    # weight on neg sim subtraction (was 1.0)
+    hire_contrastive_lambda        = 0.9,    # weight on neg sim subtraction (was 1.0)
     hire_logsumexp_beta_pos        = 10.0,   # SHARP max over positives
-    hire_logsumexp_beta_neg        = 1.0,    # SMOOTH ≈ mean over negatives
+    hire_logsumexp_beta_neg        = 9.0,    # SMOOTH ≈ mean over negatives
     hire_gamma_pbrs                = 0.99,   # discount inside PBRS shaping
     hire_sample_K                  = 64,     # K samples drawn from each buffer
     hire_online_success_frames     = "all",  # all frames of online success → positive
