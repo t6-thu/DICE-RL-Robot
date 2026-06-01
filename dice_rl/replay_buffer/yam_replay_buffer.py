@@ -56,8 +56,8 @@ class YAMReplayBuffer:
         self.hire_shaper = hire_shaper
         # Switch: when True, batches sampled from online SUCCESS episodes use the
         # original sparse reward instead of the HiRE-shaped one. Online failure
-        # episodes always use the shaped reward; offline expert always uses
-        # sparse (= 1.0 per `_sample_expert`).
+        # episodes always use the shaped reward. Offline expert demos use a
+        # sparse +1 only on the terminal transition (matches online success).
         self.use_sparse_for_online_success = bool(use_sparse_for_online_success)
 
         # ---- expert buffer (preloaded from BC training npz) ----
@@ -69,11 +69,15 @@ class YAMReplayBuffer:
         self._expert_traj_lengths = d["traj_lengths"].astype(int)
         ep_starts = np.concatenate([[0], np.cumsum(self._expert_traj_lengths[:-1])])
 
-        # Build valid (t, ep_start) index pairs for expert buffer.
+        # Build valid (t, ep_start, ep_end_t) index triples for the expert
+        # buffer.  `ep_end_t` is the last valid transition start index in the
+        # episode (so the +1 sparse reward and done=True are placed there).
         self._expert_indices = []
         for s, length in zip(ep_starts, self._expert_traj_lengths):
-            for t in range(s, s + int(length) - 1):  # -1 so next_t exists
-                self._expert_indices.append((t, int(s)))
+            s = int(s); L = int(length)
+            ep_end_t = s + L - 2   # last valid t (range(s, s+L-1) stops here)
+            for t in range(s, s + L - 1):
+                self._expert_indices.append((t, s, ep_end_t))
         self._expert_indices = np.array(self._expert_indices, dtype=np.int64)
         log.info("Expert buffer: %d transitions from %d episodes",
                  len(self._expert_indices), len(self._expert_traj_lengths))
@@ -127,13 +131,23 @@ class YAMReplayBuffer:
         # `use_sparse_for_online_success` switch).
         success = bool(R_sparse[-1] > 0.5) if len(R_sparse) > 0 else False
 
-        # HiRE PBRS shaping: r_t_shaped = r_t_sparse + γ·Φ(s_{t+1}) − Φ(s_t)
-        # We store BOTH sparse and shaped per transition so sample time can
-        # pick between them via the switch.
+        # Per-transition arrays (length T-1). The env-runner stores rewards and
+        # dones state-aligned: R_sparse[T-1]=1 means "+1 upon arriving at
+        # terminal state s_{T-1}", and D[T-1]=True. The standard MDP convention
+        # for transition t = (s_t, a_t → s_{t+1}) is r_t = R_sparse[t+1] and
+        # d_t = D[t+1], so the last stored transition (t=T-2) correctly carries
+        # the terminal +1 / done flag. Without this shift the +1 reward is
+        # silently dropped, and the critic learns nothing distinguishing
+        # success from failure on online rollouts.
+        R_sparse_tr = R_sparse[1:T] if T > 0 else R_sparse  # length T-1
+        D_tr        = D[1:T]        if T > 0 else D
+
+        # HiRE PBRS shaping: r̃_t = r_t + γ·Φ(s_{t+1}) − Φ(s_t), already in
+        # transition-aligned form (length T-1).
         if self.hire_shaper is not None and self.hire_shaper.is_ready():
-            R_shaped = self.hire_shaper.shape_rewards(R_sparse, I)
+            R_shaped_tr = self.hire_shaper.shape_rewards(R_sparse, I)
         else:
-            R_shaped = R_sparse.copy()
+            R_shaped_tr = R_sparse_tr.copy()
 
         for t in range(T - 1):
             obs      = self._make_obs(I, S, t,   ep_start)
@@ -143,8 +157,8 @@ class YAMReplayBuffer:
                 a = np.tile(a, (self.action_horizon, 1))
             # Tuple format: (obs, action, r_shaped, r_sparse, is_success, next_obs, done)
             self._online.append((obs, a,
-                                 float(R_shaped[t]), float(R_sparse[t]),
-                                 success, next_obs, D[t]))
+                                 float(R_shaped_tr[t]), float(R_sparse_tr[t]),
+                                 success, next_obs, bool(D_tr[t])))
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
@@ -197,13 +211,19 @@ class YAMReplayBuffer:
         idxs = np.random.randint(0, len(self._expert_indices), n)
         rows = self._expert_indices[idxs]
         obs_list, next_obs_list, acts, rews, dones = [], [], [], [], []
-        for t, ep_start in rows:
+        for t, ep_start, ep_end_t in rows:
             o  = self._make_obs(self._expert_images, self._expert_states, t,   ep_start)
             no = self._make_obs(self._expert_images, self._expert_states, t+1, ep_start)
             obs_list.append(o); next_obs_list.append(no)
             acts.append(np.tile(self._expert_actions[t], (self.action_horizon, 1)))
-            rews.append(1.0)   # expert demonstrations treated as success
-            dones.append(False)
+            # Sparse-style supervision: every expert demo ends in success, so
+            # only the terminal transition carries +1 and done=True. This
+            # matches the convention used for online success episodes and the
+            # original DICE-RL codebase (which reads per-transition rewards
+            # from the expert npz rather than hardcoding 1.0 every step).
+            is_terminal = (int(t) == int(ep_end_t))
+            rews.append(1.0 if is_terminal else 0.0)
+            dones.append(is_terminal)
         return _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert=True)
 
     def _sample_online(self, n: int, dev: torch.device) -> dict:

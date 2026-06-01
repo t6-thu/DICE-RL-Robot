@@ -404,17 +404,28 @@ class HireRewardShaper:
     @torch.no_grad()
     def shape_rewards(self, sparse_rewards: np.ndarray,
                       images_T6HW_f01: np.ndarray) -> np.ndarray:
-        """Return r_sparse + γ·Φ(s_{t+1}) − Φ(s_t)  for t = 0…T−2 (last unchanged)."""
-        T = int(images_T6HW_f01.shape[0])
-        if T == 0:
-            return sparse_rewards.astype(np.float32).copy()
-        if not self.is_ready():
-            return sparse_rewards.astype(np.float32).copy()
+        """Return per-transition shaped rewards of length T-1.
 
-        phi = self._compute_potential(images_T6HW_f01)   # (T,)
-        new = sparse_rewards.astype(np.float32).copy()
+        For transition t = (s_t, a_t → s_{t+1}), the shaped reward is
+            r̃_t = r_t + γ·Φ(s_{t+1}) − Φ(s_t)
+        where r_t is the env-emitted reward upon arriving at s_{t+1}
+        (i.e. `sparse_rewards[t+1]` in the env runner's state-aligned array).
+
+        This keeps the sparse +1 at the terminal state intact: the last
+        returned entry (index T-2) carries the +1 (on success) plus the
+        boundary PBRS term, and it is the transition that the replay buffer
+        actually stores.
+        """
+        T = int(images_T6HW_f01.shape[0])
+        sparse = np.asarray(sparse_rewards, dtype=np.float32)
+        if T <= 1:
+            return sparse[1:T].copy()
+        if not self.is_ready():
+            return sparse[1:T].copy()
+
+        phi = self._compute_potential(images_T6HW_f01)             # (T,)
+        out = np.empty(T - 1, dtype=np.float32)
         for t in range(T - 1):
             r_dense = self.gamma_pbrs * phi[t + 1] - phi[t]
-            new[t] = sparse_rewards[t] + r_dense
-        # The final transition is not stored in the buffer; leave new[-1] as-is.
-        return new
+            out[t] = sparse[t + 1] + r_dense
+        return out
