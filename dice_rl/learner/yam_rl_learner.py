@@ -89,7 +89,7 @@ class YAMRLLearner:
         use_q_normalization: bool = True,       # divide q_loss by mean(|Q|)
         disable_q_loss_for_expert_data: bool = True,  # mask Q-loss on expert samples
         # BC loss filter (matches original distill_rl.py actor_loss post-warmup branch)
-        use_soft_q_filtering: bool = True,
+        use_soft_q_filtering: bool = False,
         q_filtering_warmup_steps: int = 25000,
         # HiRE — Hindsight Reward Editing (contrastive + PBRS dense reward)
         use_hire_reward: bool = False,
