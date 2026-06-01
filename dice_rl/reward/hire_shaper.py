@@ -218,12 +218,13 @@ class HireRewardShaper:
         return n
 
     @torch.no_grad()
-    def build_from_expert_npz(self, expert_npz_path: str) -> int:
+    def build_from_expert_npz(self, expert_npz_path: str,
+                              curation_path: Optional[str] = None) -> int:
         """Encode (strided) frames from offline expert and add to positive buffer.
 
-        Expert npz contains `images` of shape (T_total, 6, H, W) uint8 — all
-        treated as successful (positive). Sub-sampled by `expert_frame_stride`.
-        Prefers a sidecar `<stem>_images.npy` if present (fast mmap).
+        If `curation_path` points to a JSON produced by `scripts/curate_expert.py`
+        with an "include" list of episode indices, only frames from those
+        trajectories are used. Otherwise ALL trajectories are used.
         """
         if not os.path.isfile(expert_npz_path):
             log.warning("HiRE: expert npz %s missing — skipping offline positives",
@@ -240,7 +241,36 @@ class HireRewardShaper:
             images = d["images"]
 
         T_total = int(images.shape[0])
-        indices = np.arange(0, T_total, self.expert_frame_stride)
+
+        # Build candidate frame index list.
+        if curation_path and os.path.isfile(curation_path):
+            import json
+            with open(curation_path) as f:
+                cur = json.load(f)
+            include_eps = sorted(set(int(x) for x in cur.get("include", [])))
+            if not include_eps:
+                log.warning("HiRE: curation %s has empty `include` list — "
+                            "falling back to ALL trajectories", curation_path)
+                indices = np.arange(0, T_total, self.expert_frame_stride)
+            else:
+                # Need traj_lengths to slice per-episode
+                d_npz = np.load(expert_npz_path)
+                traj_lengths = d_npz["traj_lengths"].astype(int)
+                ep_starts    = np.concatenate([[0], np.cumsum(traj_lengths)])
+                idx_chunks = []
+                for ep in include_eps:
+                    if ep < 0 or ep >= len(traj_lengths):
+                        continue
+                    s, e = int(ep_starts[ep]), int(ep_starts[ep + 1])
+                    idx_chunks.append(np.arange(s, e, self.expert_frame_stride))
+                indices = np.concatenate(idx_chunks) if idx_chunks \
+                    else np.arange(0, T_total, self.expert_frame_stride)
+                log.info("HiRE: curation %s → using %d/%d expert episodes",
+                         os.path.basename(curation_path),
+                         len(include_eps), len(traj_lengths))
+        else:
+            indices = np.arange(0, T_total, self.expert_frame_stride)
+
         cap = self.max_pos_buffer_size
         if len(indices) > cap:
             rng = np.random.default_rng(0)

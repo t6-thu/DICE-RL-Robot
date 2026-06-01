@@ -94,6 +94,7 @@ class YAMRLLearner:
         # HiRE — Hindsight Reward Editing (contrastive + PBRS dense reward)
         use_hire_reward: bool = False,
         hire_init_dir: str = None,                # past online episodes to seed pos/neg
+        hire_expert_curation_path: str = None,    # JSON listing which expert eps to include
         hire_reward_weight: float = 1.0,
         hire_contrastive_lambda: float = 0.1,
         hire_logsumexp_beta_pos: float = 10.0,    # sharp max for positive (goal-like)
@@ -224,7 +225,10 @@ class YAMRLLearner:
             #    This is the only seeding HiRE always does — it gives the
             #    shaper "ideal goal-state" reference embeddings before any
             #    online interaction has happened.
-            self.hire_shaper.build_from_expert_npz(expert_npz_path)
+            self.hire_shaper.build_from_expert_npz(
+                expert_npz_path,
+                curation_path=hire_expert_curation_path,
+            )
             # 2) Optionally seed pos/neg from a past-run directory of online
             #    episodes (e.g. a previous HiRE checkpoint to resume from).
             #    Skipped when `hire_init_dir is None` so HiRE training starts

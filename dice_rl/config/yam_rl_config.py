@@ -106,8 +106,14 @@ EXPERT_NPZ = os.path.join(_data_dir,
                           "yam_picknplace_arizonabottle_224", "train.npz")
 NORM_NPZ   = os.path.join(_data_dir,
                           "yam_picknplace_arizonabottle_224", "normalization.npz")
-ONLINE_DATA_DIR = os.path.join(_data_dir, "yam_rl_rollouts_hire")
-RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning_hire")
+# ---- Run name ----
+# Change this string to spin up a fresh experiment without touching previous
+# data / checkpoints / logs. Each value of RUN_NAME owns its own:
+#   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
+#   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
+RUN_NAME        = "hire_v2"
+ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
+RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
 # Past-run directory used ONLY to seed the HiRE positive/negative buffers.
 # Set to None to start HiRE training from scratch (no online data seed) —
@@ -118,6 +124,13 @@ RL_CKPT_DIR     = os.path.join(_ckpt_dir, "yam_rl_finetuning_hire")
 # experiment. Fair comparison: HiRE starts with 0 online episodes, just
 # like the baseline did.)
 HIRE_INIT_DIR   = None
+
+# Optional JSON file with `include`/`exclude` episode-index lists for the
+# offline expert npz. Produced by `python scripts/curate_expert.py`. When
+# present, ONLY the `include`'d expert trajectories are encoded into the
+# HiRE positive buffer. Set to None to use ALL expert trajectories.
+HIRE_EXPERT_CURATION_PATH = os.path.join(_data_dir,
+    "yam_picknplace_arizonabottle_224", "expert_curation.json")
 
 # ============================================================
 # Training algorithm settings
@@ -189,7 +202,9 @@ TRAINING = dict(
     hire_gamma_pbrs                = 0.99,   # discount inside PBRS shaping
     hire_sample_K                  = 64,     # K samples drawn from each buffer
     hire_online_success_frames     = "all",  # all frames of online success → positive
-    hire_online_failure_frames     = 1,      # last 1 frame of online failure → negative
+    hire_online_failure_frames     = 15,     # last 15 frames of online failure → negative
+                                              #   (was 1; 15 captures the "failure mode" build-up,
+                                              #    not just the very last frame)
     hire_expert_frame_stride       = 5,      # subsample offline expert frames (stride)
     # FIFO caps per camera:
     #   pos_buffer (cap=4096): seeded by offline expert; online success frames
@@ -197,7 +212,8 @@ TRAINING = dict(
     #   neg_buffer (cap=10): only the most-recent online failure end-frames —
     #     small on purpose so the policy adapts to its current failure modes.
     hire_max_pos_buffer_size       = 4096,
-    hire_max_neg_buffer_size       = 20,
+    hire_max_neg_buffer_size       = 300,    # 15 frames × 20 recent failures = 300; gives a meaningful
+                                              # window of "current failure modes" without being too stale
 
     # Reward-recipe switch:
     #   False (default) → online success uses HiRE-shaped reward (full method)
