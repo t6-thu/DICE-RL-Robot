@@ -111,7 +111,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "hire_lambda09_fixedsuccess"
+RUN_NAME        = "hire_v2_recover"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -177,7 +177,7 @@ TRAINING = dict(
     use_q_normalization          = True, # divide q_loss by mean(|Q|) for scale stability
     disable_q_loss_for_expert_data = True,  # only push actor toward Q on online states
     # --- BC loss filter (DICE-RL's core innovation; codebase default = active) ---
-    use_soft_q_filtering         = True, # turn on the BC filter after warmup
+    use_soft_q_filtering         = False, # turn on the BC filter after warmup
     q_filtering_warmup_steps     = 25000, # use simple Q+BC for first N steps (codebase default)
     # --- HiRE (Hindsight Reward Editing): contrastive_prompt + PBRS dense reward ---
     # When enabled, each transition's reward becomes:
@@ -196,9 +196,9 @@ TRAINING = dict(
     # the policy away from common failure patterns.
     use_hire_reward                = True,
     hire_reward_weight             = 1.0,    # scales Φ
-    hire_contrastive_lambda        = 0.9,    # weight on neg sim subtraction (was 1.0)
+    hire_contrastive_lambda        = 0.1,    # hire_v2 value (peak 60%) — was 0.9 in lambda09
     hire_logsumexp_beta_pos        = 10.0,   # SHARP max over positives
-    hire_logsumexp_beta_neg        = 9.0,    # SMOOTH ≈ mean over negatives
+    hire_logsumexp_beta_neg        = 1.0,    # hire_v2 value — SMOOTH mean over negatives
     hire_gamma_pbrs                = 0.99,   # discount inside PBRS shaping
     hire_sample_K                  = 64,     # K samples drawn from each buffer
     hire_online_success_frames     = "all",  # all frames of online success → positive
