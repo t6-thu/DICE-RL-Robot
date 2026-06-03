@@ -113,9 +113,20 @@ class HireRewardShaper:
         online_success_frames="all",        # "all" or an int — frames per online success
         online_failure_frames: int = 1,     # last N frames per online failure (paper: 1)
         expert_frame_stride: int = 5,       # sub-sample offline expert (every Nth frame)
-        # Two independent FIFO caps per camera (pos shared between offline + online):
+        # Two independent FIFO caps per camera:
         max_pos_buffer_size: int = 4096,    # positive buffer: offline expert + online success FIFO
         max_neg_buffer_size: int = 10,      # negative buffer: recent online failures (small FIFO)
+        # NEW: Split positive buffer into expert and online; control sampling
+        # proportion between them at HiRE-reward time.
+        # online_pos_ratio = 1.0 → 100 % of sampled positives from online success
+        #                          (matches the empirical "3.2× sharper Δ" finding —
+        #                           offline expert demos suffer a visual domain gap
+        #                           with online frames and contribute near-constant
+        #                           sim_pos, masking the success/failure signal).
+        # online_pos_ratio = 0.0 → 100 % from offline expert (original behavior).
+        # online_pos_ratio = r   → ⌊K*r⌋ from online, K-⌊K*r⌋ from expert.
+        # If one pool is empty, all K samples come from the other.
+        online_pos_ratio: float = 1.0,
         encode_batch_size: int = 32,
     ) -> None:
         self.encoder = encoder
@@ -132,28 +143,62 @@ class HireRewardShaper:
         self.expert_frame_stride   = max(1, int(expert_frame_stride))
         self.max_pos_buffer_size   = int(max_pos_buffer_size)
         self.max_neg_buffer_size   = int(max_neg_buffer_size)
+        self.online_pos_ratio      = max(0.0, min(1.0, float(online_pos_ratio)))
         self.encode_batch_size     = int(encode_batch_size)
 
         # Per-camera FIFO buffers.
-        # pos_buffer holds both offline-expert frames (built once at init) and
-        # online-success frames (appended as episodes come in). Cap is shared:
-        # newer online success frames eventually push out the oldest expert
-        # frames via FIFO.
-        self.pos_buffer: Dict[str, torch.Tensor] = {}
-        self.neg_buffer: Dict[str, torch.Tensor] = {}
+        # SPLIT positive buffer: expert vs online-success kept separate so that
+        # sampling can be drawn from either pool independently. Both still cap
+        # at `max_pos_buffer_size` per pool (so the total positive capacity is
+        # 2 × max_pos_buffer_size, but the original single-pool semantics are
+        # preserved when online_pos_ratio=0.0).
+        self.pos_buffer_expert: Dict[str, torch.Tensor] = {}
+        self.pos_buffer_online: Dict[str, torch.Tensor] = {}
+        self.neg_buffer:        Dict[str, torch.Tensor] = {}
 
     # ------------------------------------------------------------------
     # Buffer management
     # ------------------------------------------------------------------
 
     def is_ready(self) -> bool:
-        """True iff at least one camera has any embeddings in pos or neg buffer."""
+        """True iff at least one camera has any embeddings in any positive/negative buffer."""
         for cam in self.cameras:
-            for buf in (self.pos_buffer, self.neg_buffer):
+            for buf in (self.pos_buffer_expert, self.pos_buffer_online, self.neg_buffer):
                 t = buf.get(cam)
                 if t is not None and t.numel() > 0:
                     return True
         return False
+
+    def _pos_buffer_for_sampling(self, cam: str) -> Optional[torch.Tensor]:
+        """Sample-time positive pool for one camera, respecting online_pos_ratio.
+
+        Returns up to K vectors stacked, drawn ratio-wise from online vs expert.
+        Falls back to whichever pool has data if the other is empty. Returns
+        None only if BOTH pools are empty for this camera.
+        """
+        exp = self.pos_buffer_expert.get(cam)
+        onl = self.pos_buffer_online.get(cam)
+        has_exp = exp is not None and exp.numel() > 0
+        has_onl = onl is not None and onl.numel() > 0
+        if not has_exp and not has_onl:
+            return None
+        if not has_exp:
+            return self._sample_buffer(onl)
+        if not has_onl:
+            return self._sample_buffer(exp)
+        K = self.sample_K
+        K_onl = int(round(K * self.online_pos_ratio))
+        K_exp = K - K_onl
+        parts = []
+        if K_onl > 0:
+            n_onl = min(K_onl, onl.shape[0])
+            idx = torch.randperm(onl.shape[0], device=self.device)[:n_onl]
+            parts.append(onl[idx])
+        if K_exp > 0:
+            n_exp = min(K_exp, exp.shape[0])
+            idx = torch.randperm(exp.shape[0], device=self.device)[:n_exp]
+            parts.append(exp[idx])
+        return torch.cat(parts, dim=0) if parts else None
 
     @torch.no_grad()
     def _append_to_buffer(self, buf: Dict[str, torch.Tensor],
@@ -204,7 +249,7 @@ class HireRewardShaper:
         if success:
             n = T if self.online_success_frames == "all" \
                   else min(int(self.online_success_frames), T)
-            target_buf = self.pos_buffer
+            target_buf = self.pos_buffer_online   # ← online success goes to ONLINE pool only
             cap        = self.max_pos_buffer_size
         else:
             n = min(int(self.online_failure_frames), T)
@@ -220,11 +265,26 @@ class HireRewardShaper:
     @torch.no_grad()
     def build_from_expert_npz(self, expert_npz_path: str,
                               curation_path: Optional[str] = None) -> int:
-        """Encode (strided) frames from offline expert and add to positive buffer.
+        """Encode strided frames from offline expert and add to positive buffer.
+
+        Sampling pattern (per episode):
+          Start at the LAST frame (terminal = the "success state") and step
+          BACKWARD by `expert_frame_stride` toward the beginning. The resulting
+          per-episode indices are then sorted ascending for batch-encoding.
+
+          Example with stride=5 on a 200-frame episode:
+              picked = {199, 194, 189, ..., 4}   ← anchored at terminal
+
+          This guarantees:
+          * the terminal "goal state" is always sampled (was previously
+            absent when stride didn't divide L-1)
+          * sampled frames are phase-aligned to the success endpoint across
+            episodes of different lengths, which gives Φ a sharper "near-goal"
+            signal at training time.
 
         If `curation_path` points to a JSON produced by `scripts/curate_expert.py`
-        with an "include" list of episode indices, only frames from those
-        trajectories are used. Otherwise ALL trajectories are used.
+        with an "include" list of episode indices, only those trajectories are
+        used. Otherwise ALL trajectories are used.
         """
         if not os.path.isfile(expert_npz_path):
             log.warning("HiRE: expert npz %s missing — skipping offline positives",
@@ -242,40 +302,50 @@ class HireRewardShaper:
 
         T_total = int(images.shape[0])
 
-        # Build candidate frame index list.
+        # Need traj_lengths for the backward-from-terminal stride below.
+        d_npz = np.load(expert_npz_path)
+        traj_lengths = d_npz["traj_lengths"].astype(int)
+        ep_starts    = np.concatenate([[0], np.cumsum(traj_lengths)])
+        n_eps        = int(len(traj_lengths))
+
+        # Determine which episodes to include.
+        include_eps: List[int]
         if curation_path and os.path.isfile(curation_path):
             import json
             with open(curation_path) as f:
                 cur = json.load(f)
-            include_eps = sorted(set(int(x) for x in cur.get("include", [])))
-            if not include_eps:
+            cur_ids = sorted(set(int(x) for x in cur.get("include", [])))
+            if not cur_ids:
                 log.warning("HiRE: curation %s has empty `include` list — "
                             "falling back to ALL trajectories", curation_path)
-                indices = np.arange(0, T_total, self.expert_frame_stride)
+                include_eps = list(range(n_eps))
             else:
-                # Need traj_lengths to slice per-episode
-                d_npz = np.load(expert_npz_path)
-                traj_lengths = d_npz["traj_lengths"].astype(int)
-                ep_starts    = np.concatenate([[0], np.cumsum(traj_lengths)])
-                idx_chunks = []
-                for ep in include_eps:
-                    if ep < 0 or ep >= len(traj_lengths):
-                        continue
-                    s, e = int(ep_starts[ep]), int(ep_starts[ep + 1])
-                    idx_chunks.append(np.arange(s, e, self.expert_frame_stride))
-                indices = np.concatenate(idx_chunks) if idx_chunks \
-                    else np.arange(0, T_total, self.expert_frame_stride)
+                include_eps = [ep for ep in cur_ids if 0 <= ep < n_eps]
                 log.info("HiRE: curation %s → using %d/%d expert episodes",
                          os.path.basename(curation_path),
-                         len(include_eps), len(traj_lengths))
+                         len(include_eps), n_eps)
         else:
-            indices = np.arange(0, T_total, self.expert_frame_stride)
+            include_eps = list(range(n_eps))
+
+        # Per-episode backward-stride from terminal (e - 1), spanning back to s.
+        stride = self.expert_frame_stride
+        idx_chunks = []
+        for ep in include_eps:
+            s = int(ep_starts[ep])
+            e = int(ep_starts[ep + 1])     # exclusive end
+            if e <= s:
+                continue
+            idx = np.arange(e - 1, s - 1, -stride)   # e-1, e-1-stride, ...
+            idx = idx[::-1]                          # ascending order
+            idx_chunks.append(idx)
+        indices = (np.concatenate(idx_chunks).astype(np.int64) if idx_chunks
+                   else np.arange(0, T_total, stride, dtype=np.int64))
 
         cap = self.max_pos_buffer_size
         if len(indices) > cap:
             rng = np.random.default_rng(0)
             indices = np.sort(rng.choice(indices, cap, replace=False))
-        log.info("HiRE: encoding %d offline-expert frames (of %d total, stride=%d) → pos_buffer (cap=%d)…",
+        log.info("HiRE: encoding %d offline-expert frames (of %d total, stride=%d) → pos_buffer_expert (cap=%d)…",
                  len(indices), T_total, self.expert_frame_stride, cap)
 
         added = 0
@@ -289,14 +359,14 @@ class HireRewardShaper:
                 sel = sel.astype(np.float32)
             base  = torch.from_numpy(sel[:, :3])
             wrist = torch.from_numpy(sel[:, 3:])
-            self._append_to_buffer(self.pos_buffer, "base",
+            self._append_to_buffer(self.pos_buffer_expert, "base",
                                    self.encoder.encode(base),  cap=cap)
-            self._append_to_buffer(self.pos_buffer, "wrist",
+            self._append_to_buffer(self.pos_buffer_expert, "wrist",
                                    self.encoder.encode(wrist), cap=cap)
             added += sel.shape[0]
-        log.info("HiRE: pos_buffer after expert: %s",
-                 {c: tuple(self.pos_buffer[c].shape)
-                  for c in self.cameras if c in self.pos_buffer})
+        log.info("HiRE: pos_buffer_expert after expert: %s",
+                 {c: tuple(self.pos_buffer_expert[c].shape)
+                  for c in self.cameras if c in self.pos_buffer_expert})
         return added
 
     @torch.no_grad()
@@ -322,16 +392,20 @@ class HireRewardShaper:
                 n_pos_ep += 1; n_pos_f += added
             else:
                 n_neg_ep += 1; n_neg_f += added
-        log.info("HiRE: pos_buffer += %d frames from %d success episodes (FIFO cap=%d)",
+        log.info("HiRE: pos_buffer_online += %d frames from %d success episodes (FIFO cap=%d)",
                  n_pos_f, n_pos_ep, self.max_pos_buffer_size)
         log.info("HiRE: neg_buffer += %d frames from %d failure episodes (FIFO cap=%d)",
                  n_neg_f, n_neg_ep, self.max_neg_buffer_size)
         for cam in self.cameras:
-            pos = self.pos_buffer.get(cam)
+            pe  = self.pos_buffer_expert.get(cam)
+            po  = self.pos_buffer_online.get(cam)
             neg = self.neg_buffer.get(cam)
-            log.info("HiRE: camera=%s  pos=%s  neg=%s", cam,
-                     tuple(pos.shape) if pos is not None else None,
-                     tuple(neg.shape) if neg is not None else None)
+            log.info("HiRE: camera=%s  pos_expert=%s  pos_online=%s  neg=%s  (online_pos_ratio=%.2f)",
+                     cam,
+                     tuple(pe.shape)  if pe  is not None else None,
+                     tuple(po.shape)  if po  is not None else None,
+                     tuple(neg.shape) if neg is not None else None,
+                     self.online_pos_ratio)
 
     # ------------------------------------------------------------------
     # Similarity & potential
@@ -380,9 +454,11 @@ class HireRewardShaper:
         sim_total = torch.zeros(T, device=self.device)
         # Re-sample K from each buffer once per episode (paper does so per step
         # but per-episode sampling is much faster and statistically similar).
-        pos_b = self._sample_buffer(self.pos_buffer.get("base"))
+        # Positives are drawn ratio-wise from online-success vs offline-expert
+        # (see _pos_buffer_for_sampling — online_pos_ratio controls the mix).
+        pos_b = self._pos_buffer_for_sampling("base")
         neg_b = self._sample_buffer(self.neg_buffer.get("base"))
-        pos_w = self._sample_buffer(self.pos_buffer.get("wrist"))
+        pos_w = self._pos_buffer_for_sampling("wrist")
         neg_w = self._sample_buffer(self.neg_buffer.get("wrist"))
 
         if "base" in self.cameras:

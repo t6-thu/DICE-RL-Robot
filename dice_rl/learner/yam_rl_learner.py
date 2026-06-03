@@ -246,6 +246,9 @@ class YAMRLLearner:
                      self.use_sparse_for_online_success)
 
         # ---- replay buffer ----
+        # The same curation JSON (consumed by HiRE) is also used here so the
+        # offline expert training set is restricted to the curator-approved
+        # trajectories.  Pass None / missing-file to use ALL expert episodes.
         self.replay_buffer = YAMReplayBuffer(
             expert_npz_path=expert_npz_path,
             online_data_dir=online_data_dir,
@@ -255,6 +258,7 @@ class YAMRLLearner:
             device=device,
             hire_shaper=self.hire_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
+            expert_curation_path=hire_expert_curation_path,
         )
 
         # ---- ZMQ communication ----

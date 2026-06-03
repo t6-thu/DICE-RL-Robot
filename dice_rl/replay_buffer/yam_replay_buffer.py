@@ -35,6 +35,29 @@ log = logging.getLogger(__name__)
 class YAMReplayBuffer:
     """Simple RLPD-compatible replay buffer for YAM joint-space policy."""
 
+    @staticmethod
+    def _load_curation_include_ids(path: Optional[str], n_eps: int) -> Optional[list]:
+        """Read curation JSON and return list of episode indices to include.
+
+        Returns None if `path` is falsy / missing / contains empty `include`.
+        Out-of-range indices are dropped. Output is sorted unique.
+        """
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            import json
+            with open(path) as f:
+                cur = json.load(f)
+        except Exception as e:
+            log.warning("Replay buffer: failed to read curation %s (%s)", path, e)
+            return None
+        raw = sorted(set(int(x) for x in cur.get("include", [])))
+        valid = [ep for ep in raw if 0 <= ep < n_eps]
+        if not valid:
+            log.warning("Replay buffer: curation %s has empty/invalid `include` list", path)
+            return None
+        return valid
+
     def __init__(
         self,
         expert_npz_path: str,
@@ -46,6 +69,7 @@ class YAMReplayBuffer:
         device: str = "cuda",
         hire_shaper=None,
         use_sparse_for_online_success: bool = False,
+        expert_curation_path: Optional[str] = None,
     ) -> None:
         self.obs_horizon = obs_horizon
         self.action_dim = action_dim
@@ -68,19 +92,33 @@ class YAMReplayBuffer:
         self._expert_images = d["images"]                       # (T, 6, H, W) uint8
         self._expert_traj_lengths = d["traj_lengths"].astype(int)
         ep_starts = np.concatenate([[0], np.cumsum(self._expert_traj_lengths[:-1])])
+        n_eps = int(len(self._expert_traj_lengths))
+
+        # Optional curation: filter which expert episodes are used for RL
+        # training (via the same JSON sidecar consumed by HiRE).  Without
+        # curation, all `n_eps` trajectories are included.
+        include_eps = self._load_curation_include_ids(expert_curation_path, n_eps)
+        if include_eps is None:
+            include_eps = list(range(n_eps))
+        else:
+            log.info("Replay buffer: curation %s → using %d/%d expert episodes for training",
+                     os.path.basename(expert_curation_path), len(include_eps), n_eps)
+        include_set = set(int(x) for x in include_eps)
 
         # Build valid (t, ep_start, ep_end_t) index triples for the expert
         # buffer.  `ep_end_t` is the last valid transition start index in the
         # episode (so the +1 sparse reward and done=True are placed there).
         self._expert_indices = []
-        for s, length in zip(ep_starts, self._expert_traj_lengths):
+        for ep, (s, length) in enumerate(zip(ep_starts, self._expert_traj_lengths)):
+            if ep not in include_set:
+                continue
             s = int(s); L = int(length)
             ep_end_t = s + L - 2   # last valid t (range(s, s+L-1) stops here)
             for t in range(s, s + L - 1):
                 self._expert_indices.append((t, s, ep_end_t))
         self._expert_indices = np.array(self._expert_indices, dtype=np.int64)
-        log.info("Expert buffer: %d transitions from %d episodes",
-                 len(self._expert_indices), len(self._expert_traj_lengths))
+        log.info("Expert buffer: %d transitions from %d episodes (of %d total in npz)",
+                 len(self._expert_indices), len(include_eps), n_eps)
 
         # ---- online buffer (ring buffer for rollout data) ----
         self.online_data_dir = online_data_dir

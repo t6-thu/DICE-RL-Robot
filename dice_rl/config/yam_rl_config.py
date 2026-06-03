@@ -111,7 +111,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "hire_noclamp_lambda01_onlinepos"
+RUN_NAME        = "bc140_curated_terminalstride"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -167,7 +167,7 @@ TRAINING = dict(
     tau                  = 0.01,     # target critic Polyak rate
     actor_lr             = 1e-4,
     critic_lr            = 1e-4,
-    bc_loss_weight       = 100.0,   # BC regularisation weight — matches the original codebase
+    bc_loss_weight       = 140.0,   # BC regularisation weight — matches the original codebase
                                      # (rl_finetuning_config.py model_para["bc_loss_weight"]=140).
                                      # The paper's appendix table reports 100, but real-robot tuning
                                      # in the codebase converged to 140.
