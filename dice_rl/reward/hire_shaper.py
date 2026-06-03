@@ -487,10 +487,11 @@ class HireRewardShaper:
         where r_t is the env-emitted reward upon arriving at s_{t+1}
         (i.e. `sparse_rewards[t+1]` in the env runner's state-aligned array).
 
-        This keeps the sparse +1 at the terminal state intact: the last
-        returned entry (index T-2) carries the +1 (on success) plus the
-        boundary PBRS term, and it is the transition that the replay buffer
-        actually stores.
+        Terminal boundary (t = T-2, the last stored transition):
+            Φ(s_{T-1}) is forced to 0 per standard PBRS (Ng et al. 1999).
+            Without this, the critic sees an extra γ·Φ(s_terminal) in the
+            last-step reward that is never cancelled by a next-state Q value
+            (done=True zeros out the bootstrap), breaking policy invariance.
         """
         T = int(images_T6HW_f01.shape[0])
         sparse = np.asarray(sparse_rewards, dtype=np.float32)
@@ -502,6 +503,7 @@ class HireRewardShaper:
         phi = self._compute_potential(images_T6HW_f01)             # (T,)
         out = np.empty(T - 1, dtype=np.float32)
         for t in range(T - 1):
-            r_dense = self.gamma_pbrs * phi[t + 1] - phi[t]
+            phi_next = 0.0 if t == T - 2 else phi[t + 1]          # Φ(terminal) = 0
+            r_dense = self.gamma_pbrs * phi_next - phi[t]
             out[t] = sparse[t + 1] + r_dense
         return out
