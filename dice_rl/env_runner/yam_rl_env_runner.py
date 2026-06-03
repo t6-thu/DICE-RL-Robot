@@ -237,7 +237,7 @@ class YAMRLEnvRunner:
 
         if self.actor is not None:
             delta = self.actor(features.unsqueeze(1), noise) * self.residual_scale
-            final_n = (bc_act_n + delta)
+            final_n = (bc_act_n + delta).clamp(-1.0, 1.0)
             self._last_delta_rms = float(delta.pow(2).mean().sqrt().item())
         else:
             final_n = bc_act_n
