@@ -104,8 +104,10 @@ class YAMRLLearner:
         hire_online_success_frames="all",         # paper: all frames of online success
         hire_online_failure_frames: int = 1,      # paper: last frame of online failure
         hire_expert_frame_stride: int = 5,        # subsample offline expert
-        hire_max_pos_buffer_size: int = 4096,          # positive FIFO (offline + online share)
+        hire_max_pos_buffer_size: int = 4096,          # positive FIFO (per pool: expert / online)
         hire_max_neg_buffer_size: int = 10,            # most-recent online failures (FIFO)
+        hire_online_pos_ratio: float = 1.0,            # fraction of positive samples from online-success
+                                                       # vs offline-expert when computing sim_pos (see hire_shaper)
         # Reward-recipe switch:
         #   False (default) — online success uses HiRE shaped reward (full method)
         #   True            — online success reverts to sparse reward (offline-style)
@@ -220,6 +222,7 @@ class YAMRLLearner:
                 expert_frame_stride=hire_expert_frame_stride,
                 max_pos_buffer_size=hire_max_pos_buffer_size,
                 max_neg_buffer_size=hire_max_neg_buffer_size,
+                online_pos_ratio=hire_online_pos_ratio,
             )
             # 1) Positive buffer ← ALL (strided) frames of offline expert demos.
             #    This is the only seeding HiRE always does — it gives the

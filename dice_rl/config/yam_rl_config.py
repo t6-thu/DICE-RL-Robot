@@ -111,7 +111,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "hire_v2_recover"
+RUN_NAME        = "hire_noclamp_lambda01_onlinepos"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -214,11 +214,16 @@ TRAINING = dict(
     hire_max_pos_buffer_size       = 4096,
     hire_max_neg_buffer_size       = 300,    # 15 frames × 20 recent failures = 300; gives a meaningful
                                               # window of "current failure modes" without being too stale
+    # NEW: mix between online-success and offline-expert as the positive source
+    # for computing sim_pos. 1.0 = all online (empirical Δ(succ−fail) = +0.039,
+    # 3.2× sharper than expert-only at +0.012; expert demos suffer a visual
+    # domain gap with online frames). 0.0 = original behavior (expert only).
+    hire_online_pos_ratio          = 1.0,
 
     # Reward-recipe switch:
     #   False (default) → online success uses HiRE-shaped reward (full method)
     #   True            → online success reverts to sparse reward, like offline
-    use_sparse_for_online_success  = True,
+    use_sparse_for_online_success  = False,
     critic_ensemble_size = 5,
     max_grad_norm        = 1.0,
 )
