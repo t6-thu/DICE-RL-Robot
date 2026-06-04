@@ -500,7 +500,7 @@ class YAMRLLearner:
             self._update_target_critics()
             self.total_gradient_steps += 1
 
-            if step % 200 == 0:
+            if step % 200 == 0 or step == self.gradient_steps - 1:
                 log.info("  [step %5d/%5d] critic_loss=%.4f  actor_loss=%.4f  "
                          "expert_ratio=%.2f",
                          step, self.gradient_steps, c_loss, a_loss, er)

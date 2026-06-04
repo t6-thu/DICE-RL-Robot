@@ -111,7 +111,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "noclamp_fullexpert"
+RUN_NAME        = "noclamp_fullexpert_400"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -146,7 +146,7 @@ TRAINING = dict(
     update_every_x_episode             = 10,
     # One training round per 10 new rollouts.
 
-    gradient_steps                     = 2000,
+    gradient_steps                     = 400,
     # 2000 actor+critic updates per training round.
     # Effective data: 2000 × 256 = 512k transitions per round.
 
