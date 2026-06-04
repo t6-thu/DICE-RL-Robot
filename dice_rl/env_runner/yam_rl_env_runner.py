@@ -280,19 +280,29 @@ class YAMRLEnvRunner:
                 state_hist.append(q_pre.copy())
                 img_hist.append(img_pre.copy())
 
+            # Anchor timing to obs capture — mirrors original's
+            # action_start_time_s = obs_raw["robot_time_stamps"][-1] which
+            # schedules action[i] for t_obs + i*period. After inference, any
+            # waypoints whose deadline has already passed are skipped, exactly
+            # as the original ManipServer does with timestamped waypoints.
+            t_obs = time.monotonic()
             obs_t = self._make_obs_tensors(img_hist, state_hist)
-            t0    = time.monotonic()
             with torch.no_grad():
                 actions = self._infer(obs_t)  # (H, 7) raw
-            infer_ms = (time.monotonic() - t0) * 1000.0
+            infer_ms = (time.monotonic() - t_obs) * 1000.0
 
-            # execute chunk
-            chunk_start = time.monotonic()
-            for i, q_tgt in enumerate(actions[:self.action_horizon]):
+            # Skip waypoints already past-due: action[i] was planned for
+            # t_obs + i*period; skip any i whose deadline has passed.
+            skip_steps = min(int(infer_ms / 1000.0 / self.period),
+                             self.action_horizon - 1)
+
+            # Execute chunk anchored to t_obs (not post-inference chunk_start).
+            for actual_i in range(skip_steps, self.action_horizon):
                 if self._abort_episode["flag"]: break
                 now = time.monotonic()
-                wait = chunk_start + i * self.period - now
+                wait = t_obs + actual_i * self.period - now
                 if wait > 0: time.sleep(wait)
+                q_tgt = actions[actual_i]
 
                 q_cmd = np.clip(q_tgt.astype(np.float64),
                                 [-2.767,-0.15,-0.15,-1.72,-1.72,-2.24,0.],
@@ -309,16 +319,12 @@ class YAMRLEnvRunner:
                     img_hist.append(img_cur.copy())
 
                 # Record one raw single-step action per inner step.
-                # The replay buffer reconstructs (H,7) chunks via A[t:t+H] so
-                # it needs the dense (T_inner, 7) action stream, not pre-built
-                # sub-chunks. This matches the original DICE-RL design where the
-                # learner re-samples the dense action stream at fine stride.
                 images_rec.append(img_hist[-1].copy())
                 states_rec.append(self.state_norm.normalize(state_hist[-1]))
                 actions_rec.append(self.action_norm.normalize(q_tgt))  # (7,)
 
-            log.info("[step %3d] infer=%.1fms  delta_rms=%.3f  q=%s",
-                     step, infer_ms, self._last_delta_rms,
+            log.info("[step %3d] infer=%.1fms skip=%d delta_rms=%.3f q=%s",
+                     step, infer_ms, skip_steps, self._last_delta_rms,
                      np.round(self._read_state(), 3).tolist())
 
         # ---- user labels success/failure ----
