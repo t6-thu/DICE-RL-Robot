@@ -68,6 +68,7 @@ class YAMReplayBuffer:
         max_online_size: int = 50_000,
         device: str = "cuda",
         hire_shaper=None,
+        robometer_shaper=None,
         use_sparse_for_online_success: bool = False,
         expert_curation_path: Optional[str] = None,
     ) -> None:
@@ -75,9 +76,11 @@ class YAMReplayBuffer:
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.device = torch.device(device)
-        # Optional HiRE reward shaper: if provided and `is_ready()` is True,
-        # episodes' sparse rewards get PBRS dense shaping applied at insertion.
+        # Optional dense reward shapers (HiRE or Robometer; mutually exclusive).
         self.hire_shaper = hire_shaper
+        self.robometer_shaper = robometer_shaper
+        if hire_shaper is not None and robometer_shaper is not None:
+            raise ValueError("hire_shaper and robometer_shaper are mutually exclusive")
         # Switch: when True, batches sampled from online SUCCESS episodes use the
         # original sparse reward instead of the HiRE-shaped one. Online failure
         # episodes always use the shaped reward. Offline expert demos use a
@@ -189,7 +192,11 @@ class YAMReplayBuffer:
         # HiRE PBRS shaping with H-step lookahead:
         #   r̃_t = R_sparse[t+H] + γ·Φ(s_{t+H}) − Φ(s_t)
         # Terminal boundary: Φ(s_{T-1}) = 0 (last frame of episode).
-        if self.hire_shaper is not None and self.hire_shaper.is_ready():
+        if self.robometer_shaper is not None and self.robometer_shaper.is_ready():
+            # Robometer-only dense reward (no sparse terminal term), like HiRE-Dice
+            # robometer RLPD online rollouts.
+            R_shaped_tr = self.robometer_shaper.shape_rewards(I, horizon=H)
+        elif self.hire_shaper is not None and self.hire_shaper.is_ready():
             R_shaped_tr = self.hire_shaper.shape_rewards(R_sparse, I, horizon=H)
         else:
             # Fallback: use sparse reward at t+H with no shaping.
@@ -280,10 +287,13 @@ class YAMReplayBuffer:
         obs_list, next_obs_list, acts, rews, dones = [], [], [], [], []
         for i in idxs:
             o, a, r_shaped, r_sparse, is_success, no, d = online_list[i]
-            # Online-success switch: when ON, success transitions revert to the
-            # sparse reward (matches offline expert's sparse-style supervision).
-            # Online failures always use the HiRE-shaped reward.
-            if self.use_sparse_for_online_success and is_success:
+            # Online-success switch (HiRE only): revert success transitions to sparse.
+            # Robometer mode always uses shaped rewards for all online transitions.
+            if (
+                self.robometer_shaper is None
+                and self.use_sparse_for_online_success
+                and is_success
+            ):
                 r = r_sparse
             else:
                 r = r_shaped
