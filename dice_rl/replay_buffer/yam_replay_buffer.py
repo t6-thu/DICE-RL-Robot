@@ -106,15 +106,19 @@ class YAMReplayBuffer:
         include_set = set(int(x) for x in include_eps)
 
         # Build valid (t, ep_start, ep_end_t) index triples for the expert
-        # buffer.  `ep_end_t` is the last valid transition start index in the
-        # episode (so the +1 sparse reward and done=True are placed there).
+        # buffer.  Only include positions where a full action_horizon-step chunk
+        # fits within the episode (mirrors BC training's valid index range).
+        # `ep_end_t` is the last valid t (= s + L - action_horizon), where the
+        # chunk actions[t:t+H] ends exactly at the episode's last frame.
         self._expert_indices = []
         for ep, (s, length) in enumerate(zip(ep_starts, self._expert_traj_lengths)):
             if ep not in include_set:
                 continue
             s = int(s); L = int(length)
-            ep_end_t = s + L - 2   # last valid t (range(s, s+L-1) stops here)
-            for t in range(s, s + L - 1):
+            if L <= self.action_horizon:
+                continue  # episode too short to form even one valid chunk
+            ep_end_t = s + L - self.action_horizon   # last valid t with full H-step chunk
+            for t in range(s, s + L - self.action_horizon + 1):
                 self._expert_indices.append((t, s, ep_end_t))
         self._expert_indices = np.array(self._expert_indices, dtype=np.int64)
         log.info("Expert buffer: %d transitions from %d episodes (of %d total in npz)",
@@ -253,7 +257,7 @@ class YAMReplayBuffer:
             o  = self._make_obs(self._expert_images, self._expert_states, t,   ep_start)
             no = self._make_obs(self._expert_images, self._expert_states, t+1, ep_start)
             obs_list.append(o); next_obs_list.append(no)
-            acts.append(np.tile(self._expert_actions[t], (self.action_horizon, 1)))
+            acts.append(self._expert_actions[t : t + self.action_horizon])
             # Sparse-style supervision: every expert demo ends in success, so
             # only the terminal transition carries +1 and done=True. This
             # matches the convention used for online success episodes and the
