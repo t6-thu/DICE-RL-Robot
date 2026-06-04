@@ -479,31 +479,35 @@ class HireRewardShaper:
 
     @torch.no_grad()
     def shape_rewards(self, sparse_rewards: np.ndarray,
-                      images_T6HW_f01: np.ndarray) -> np.ndarray:
-        """Return per-transition shaped rewards of length T-1.
+                      images_T6HW_f01: np.ndarray,
+                      horizon: int = 1) -> np.ndarray:
+        """Return per-transition shaped rewards of length T-horizon.
 
-        For transition t = (s_t, a_t → s_{t+1}), the shaped reward is
-            r̃_t = r_t + γ·Φ(s_{t+1}) − Φ(s_t)
-        where r_t is the env-emitted reward upon arriving at s_{t+1}
-        (i.e. `sparse_rewards[t+1]` in the env runner's state-aligned array).
+        For transition t with next_obs at t+horizon:
+            r̃_t = R_sparse[t+horizon] + γ·Φ(s_{t+horizon}) − Φ(s_t)
 
-        Terminal boundary (t = T-2, the last stored transition):
-            Φ(s_{T-1}) is forced to 0 per standard PBRS (Ng et al. 1999).
-            Without this, the critic sees an extra γ·Φ(s_terminal) in the
-            last-step reward that is never cancelled by a next-state Q value
-            (done=True zeros out the bootstrap), breaking policy invariance.
+        horizon=1  : single-step transitions (original behaviour)
+        horizon=H  : chunk-level transitions where next_obs is one full
+                     action chunk ahead — aligns with the original DICE-RL
+                     _process_complete_episode which sets
+                     next_query_time = query_time + action_chunk_duration_ms.
+
+        Terminal boundary (last transition t = T-horizon-1):
+            Φ(s_{T-1}) is forced to 0 per PBRS (Ng et al. 1999) so that
+            the potential term cancels correctly at episode end.
         """
         T = int(images_T6HW_f01.shape[0])
         sparse = np.asarray(sparse_rewards, dtype=np.float32)
-        if T <= 1:
-            return sparse[1:T].copy()
+        n = T - horizon
+        if n <= 0:
+            return np.zeros(0, dtype=np.float32)
         if not self.is_ready():
-            return sparse[1:T].copy()
+            return sparse[horizon:T].copy()
 
         phi = self._compute_potential(images_T6HW_f01)             # (T,)
-        out = np.empty(T - 1, dtype=np.float32)
-        for t in range(T - 1):
-            phi_next = 0.0 if t == T - 2 else phi[t + 1]          # Φ(terminal) = 0
+        out = np.empty(n, dtype=np.float32)
+        for t in range(n):
+            phi_next = 0.0 if t == n - 1 else phi[t + horizon]    # Φ(terminal) = 0
             r_dense = self.gamma_pbrs * phi_next - phi[t]
-            out[t] = sparse[t + 1] + r_dense
+            out[t] = sparse[t + horizon] + r_dense
         return out

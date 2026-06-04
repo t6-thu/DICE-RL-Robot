@@ -155,11 +155,20 @@ class YAMReplayBuffer:
         """Add one online rollout episode to the buffer.
 
         episode dict keys:
-          images  : (T, 6, H, W) uint8
+          images  : (T, 6, H_img, W) float32 [0,1]
           states  : (T, 7) float32 normalized
-          actions : (T, 7) float32 normalized
+          actions : (T, 7) float32 normalized  ← dense single-step actions
           rewards : (T,) float32
           dones   : (T,) bool
+
+        Fine-stride chunk sampling (mirrors original DICE-RL's
+        _process_complete_episode):
+          For each inner step t in [0, T-action_horizon):
+            obs      = obs history ending at t
+            next_obs = obs history ending at t + action_horizon   ← one chunk ahead
+            action   = A[t : t+action_horizon]                    ← real consecutive chunk
+            reward   = R_sparse[t + action_horizon]               ← reward on arrival
+            done     = D[t + action_horizon]
         """
         S = episode["states"]
         A = episode["actions"]
@@ -167,40 +176,37 @@ class YAMReplayBuffer:
         D = episode["dones"]
         I = episode["images"]
         T = len(S)
+        H = self.action_horizon
         ep_start = 0
 
-        # Episode-level success flag (used at sample time for the
-        # `use_sparse_for_online_success` switch).
+        if T <= H:
+            log.debug("Episode too short (%d frames) for even one chunk, skipping", T)
+            self._num_online_episodes += 1
+            return
+
         success = bool(R_sparse[-1] > 0.5) if len(R_sparse) > 0 else False
 
-        # Per-transition arrays (length T-1). The env-runner stores rewards and
-        # dones state-aligned: R_sparse[T-1]=1 means "+1 upon arriving at
-        # terminal state s_{T-1}", and D[T-1]=True. The standard MDP convention
-        # for transition t = (s_t, a_t → s_{t+1}) is r_t = R_sparse[t+1] and
-        # d_t = D[t+1], so the last stored transition (t=T-2) correctly carries
-        # the terminal +1 / done flag. Without this shift the +1 reward is
-        # silently dropped, and the critic learns nothing distinguishing
-        # success from failure on online rollouts.
-        R_sparse_tr = R_sparse[1:T] if T > 0 else R_sparse  # length T-1
-        D_tr        = D[1:T]        if T > 0 else D
-
-        # HiRE PBRS shaping: r̃_t = r_t + γ·Φ(s_{t+1}) − Φ(s_t), already in
-        # transition-aligned form (length T-1).
+        # HiRE PBRS shaping with H-step lookahead:
+        #   r̃_t = R_sparse[t+H] + γ·Φ(s_{t+H}) − Φ(s_t)
+        # Terminal boundary: Φ(s_{T-1}) = 0 (last frame of episode).
         if self.hire_shaper is not None and self.hire_shaper.is_ready():
-            R_shaped_tr = self.hire_shaper.shape_rewards(R_sparse, I)
+            R_shaped_tr = self.hire_shaper.shape_rewards(R_sparse, I, horizon=H)
         else:
-            R_shaped_tr = R_sparse_tr.copy()
+            # Fallback: use sparse reward at t+H with no shaping.
+            R_shaped_tr = np.array(
+                [float(R_sparse[t + H]) for t in range(T - H)], dtype=np.float32
+            )
 
-        for t in range(T - 1):
-            obs      = self._make_obs(I, S, t,   ep_start)
-            next_obs = self._make_obs(I, S, t+1, ep_start)
-            a = A[t]
-            if a.ndim == 1:  # single action (7,) → tile to (H, 7)
-                a = np.tile(a, (self.action_horizon, 1))
+        for t in range(T - H):
+            obs      = self._make_obs(I, S, t,     ep_start)
+            next_obs = self._make_obs(I, S, t + H, ep_start)
+            chunk    = A[t : t + H]                    # (H, 7) real consecutive actions
+            r_sparse = float(R_sparse[t + H])
+            done     = bool(D[t + H])
             # Tuple format: (obs, action, r_shaped, r_sparse, is_success, next_obs, done)
-            self._online.append((obs, a,
-                                 float(R_shaped_tr[t]), float(R_sparse_tr[t]),
-                                 success, next_obs, bool(D_tr[t])))
+            self._online.append((obs, chunk,
+                                 float(R_shaped_tr[t]), r_sparse,
+                                 success, next_obs, done))
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
@@ -253,16 +259,16 @@ class YAMReplayBuffer:
         idxs = np.random.randint(0, len(self._expert_indices), n)
         rows = self._expert_indices[idxs]
         obs_list, next_obs_list, acts, rews, dones = [], [], [], [], []
+        H = self.action_horizon
         for t, ep_start, ep_end_t in rows:
-            o  = self._make_obs(self._expert_images, self._expert_states, t,   ep_start)
-            no = self._make_obs(self._expert_images, self._expert_states, t+1, ep_start)
+            o  = self._make_obs(self._expert_images, self._expert_states, t,     ep_start)
+            no = self._make_obs(self._expert_images, self._expert_states, t + H, ep_start)
             obs_list.append(o); next_obs_list.append(no)
-            acts.append(self._expert_actions[t : t + self.action_horizon])
-            # Sparse-style supervision: every expert demo ends in success, so
-            # only the terminal transition carries +1 and done=True. This
-            # matches the convention used for online success episodes and the
-            # original DICE-RL codebase (which reads per-transition rewards
-            # from the expert npz rather than hardcoding 1.0 every step).
+            acts.append(self._expert_actions[t : t + H])
+            # next_obs is one full action chunk ahead (t+H), matching the original
+            # SequenceSampler which sets next_query_time = query_time + chunk_duration_ms.
+            # ep_end_t = s + L - H, so at the terminal t, next_obs lands on the
+            # episode's last frame exactly.
             is_terminal = (int(t) == int(ep_end_t))
             rews.append(1.0 if is_terminal else 0.0)
             dones.append(is_terminal)

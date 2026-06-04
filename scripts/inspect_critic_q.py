@@ -92,14 +92,18 @@ def main():
         d = np.load(p)
         images = d["images"]      # (T, 6, H, W) float32 [0,1]
         states = d["states"]      # (T, 7) normalized
-        actions = d["actions"]    # (T, H, 7) normalized
+        actions = d["actions"]    # (T, H, 7) [old chunk] or (T, 7) [new dense]
         rewards = d["rewards"]
         is_succ = rewards[-1] > 0.5
         T = images.shape[0]
         # use obs_horizon = 2 (matches BC training)
         oh = TRAINING["obs_horizon"]
+        # For new dense (T, 7) format we need a full H-step chunk slice; for old
+        # (T, H, 7) format actions[t] is already the chunk.
+        is_dense = (actions.ndim == 2)
+        t_max = (T - H) if is_dense else (T - 1)
         # Build per-transition obs history (mirrors yam_replay_buffer._make_obs)
-        for t in range(T - 1):
+        for t in range(max(t_max, 0)):
             frames, jnts = [], []
             for k in range(oh - 1, -1, -1):
                 idx = max(t - k, 0)
@@ -111,7 +115,10 @@ def main():
                 "rgb_1":     np.stack([f[3:] for f in frames]),
                 "joint_pos": np.stack(jnts),
             }
-            a = actions[t] if actions.ndim == 3 else np.tile(actions[t], (H, 1))
+            if is_dense:
+                a = actions[t : t + H]                # (H, 7) chunk slice
+            else:
+                a = actions[t] if actions.ndim == 3 else np.tile(actions[t], (H, 1))
             target = succ_states if is_succ else fail_states
             target_a = succ_actions if is_succ else fail_actions
             target.append(obs)

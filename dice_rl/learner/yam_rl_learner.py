@@ -534,7 +534,7 @@ class YAMRLLearner:
             noise_next_K_flat = noise_next_K.reshape(B * K, H, D)
             bc_next_K_flat    = bc_next_K.reshape(B * K, H, D)
             delta_next_flat   = self.actor(feat_next_K_flat.unsqueeze(1), noise_next_K_flat)
-            next_act_flat     = bc_next_K_flat + delta_next_flat   # NO clamp (original clip_action=False)
+            next_act_flat     = bc_next_K_flat + delta_next_flat
 
             q_targets = [ct(feat_next_K_flat, noise_next_K_flat, next_act_flat)
                          for ct in self.critic_targets]
@@ -580,7 +580,7 @@ class YAMRLLearner:
 
         # actor action (with grads)
         delta_flat     = self.actor(feat_K_flat.unsqueeze(1), noise_K_flat)
-        final_act_flat = bc_K_flat + delta_flat                # NO clamp (matches codebase clip_action=False)
+        final_act_flat = bc_K_flat + delta_flat
 
         # Q(s, a_actor) with grads (for the Q-maximisation loss)
         q_actor_flat = torch.stack(

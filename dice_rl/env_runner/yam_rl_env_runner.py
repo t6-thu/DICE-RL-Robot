@@ -267,6 +267,19 @@ class YAMRLEnvRunner:
             if self._abort_episode["flag"]:
                 break
 
+            # Refresh obs with current state right before inference to minimise
+            # the perception-action latency gap: without this refresh the obs
+            # would be the state at the END of the previous chunk's last step,
+            # but by then the robot has continued converging toward that step's
+            # target. The fresh read here captures the actual current position.
+            q_pre = self._read_state()
+            br_pre, _ = self.base_cam.get(); wr_pre, _ = self.wrist_cam.get()
+            if br_pre is not None and wr_pre is not None:
+                b_p = _preprocess(br_pre); w_p = _preprocess(wr_pre)
+                img_pre = np.concatenate([b_p, w_p], axis=0)
+                state_hist.append(q_pre.copy())
+                img_hist.append(img_pre.copy())
+
             obs_t = self._make_obs_tensors(img_hist, state_hist)
             t0    = time.monotonic()
             with torch.no_grad():
@@ -295,10 +308,14 @@ class YAMRLEnvRunner:
                     state_hist.append(q_cur.copy())
                     img_hist.append(img_cur.copy())
 
-            # record full action chunk (H, 7) for critic input
-            images_rec.append(img_hist[-1].copy())
-            states_rec.append(self.state_norm.normalize(state_hist[-1]))
-            actions_rec.append(self.action_norm.normalize(actions))  # (H, 7)
+                # Record one raw single-step action per inner step.
+                # The replay buffer reconstructs (H,7) chunks via A[t:t+H] so
+                # it needs the dense (T_inner, 7) action stream, not pre-built
+                # sub-chunks. This matches the original DICE-RL design where the
+                # learner re-samples the dense action stream at fine stride.
+                images_rec.append(img_hist[-1].copy())
+                states_rec.append(self.state_norm.normalize(state_hist[-1]))
+                actions_rec.append(self.action_norm.normalize(q_tgt))  # (7,)
 
             log.info("[step %3d] infer=%.1fms  delta_rms=%.3f  q=%s",
                      step, infer_ms, self._last_delta_rms,

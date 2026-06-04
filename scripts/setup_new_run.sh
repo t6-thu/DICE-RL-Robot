@@ -28,7 +28,7 @@ sys.path.insert(0, '$(dirname "$0")/..')
 from dice_rl.config.yam_rl_config import RUN_NAME
 print(RUN_NAME)")
 
-WARMUP_POOL=${YAM_WARMUP_POOL:-$HOME/data/real_processed/yam_rl_rollouts_pos_only_no_neg}
+WARMUP_POOL=${YAM_WARMUP_POOL:-$HOME/data/real_processed/yam_warmup_pool_finestride}
 DATA_DIR=$HOME/data/real_processed/yam_rl_rollouts_${RUN_NAME}
 CKPT_DIR=$HOME/training_outputs/yam_rl_finetuning_${RUN_NAME}
 

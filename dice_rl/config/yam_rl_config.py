@@ -111,7 +111,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "noclamp_fullexpert_400"
+RUN_NAME        = "finestride_chunkplusH_2000"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -146,7 +146,7 @@ TRAINING = dict(
     update_every_x_episode             = 10,
     # One training round per 10 new rollouts.
 
-    gradient_steps                     = 400,
+    gradient_steps                     = 2000,
     # 2000 actor+critic updates per training round.
     # Effective data: 2000 × 256 = 512k transitions per round.
 
@@ -202,7 +202,7 @@ TRAINING = dict(
     hire_gamma_pbrs                = 0.99,   # discount inside PBRS shaping
     hire_sample_K                  = 64,     # K samples drawn from each buffer
     hire_online_success_frames     = "all",  # all frames of online success → positive
-    hire_online_failure_frames     = 15,     # last 15 frames of online failure → negative
+    hire_online_failure_frames     = 16,     # last 16 frames of online failure → negative
                                               #   (was 1; 15 captures the "failure mode" build-up,
                                               #    not just the very last frame)
     hire_expert_frame_stride       = 5,      # subsample offline expert frames (stride)
@@ -212,7 +212,7 @@ TRAINING = dict(
     #   neg_buffer (cap=10): only the most-recent online failure end-frames —
     #     small on purpose so the policy adapts to its current failure modes.
     hire_max_pos_buffer_size       = 4096,
-    hire_max_neg_buffer_size       = 300,    # 15 frames × 20 recent failures = 300; gives a meaningful
+    hire_max_neg_buffer_size       = 320,    # 15 frames × 20 recent failures = 300; gives a meaningful
                                               # window of "current failure modes" without being too stale
     # NEW: mix between online-success and offline-expert as the positive source
     # for computing sim_pos. 1.0 = all online (empirical Δ(succ−fail) = +0.039,
