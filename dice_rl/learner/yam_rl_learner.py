@@ -258,8 +258,8 @@ class YAMRLLearner:
             device=device,
             hire_shaper=self.hire_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
-            expert_curation_path=None,   # use ALL 117 expert episodes for RL training
-                                          # (curation only filters HiRE positive buffer above)
+            expert_curation_path=hire_expert_curation_path,  # use 24 curated episodes for RL training
+                                                              # (same JSON as HiRE positive buffer above)
         )
 
         # ---- ZMQ communication ----
