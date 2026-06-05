@@ -111,7 +111,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "finestride_chunkplusH_curated"
+RUN_NAME        = "robometer_2000_1000"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -194,7 +194,21 @@ TRAINING = dict(
     # similar to failure modes?"). Combined with a small contrastive λ=0.1,
     # this lets positives drive most of the signal while negatives gently push
     # the policy away from common failure patterns.
-    use_hire_reward                = True,
+    use_hire_reward                = False,
+    # --- Robometer-4B raw progress as online reward (mutually exclusive w/ HiRE) ---
+    # When True, online per-transition reward = robometer_reward_weight *
+    # progress(s_{t+H}) returned by the eval server (base-camera video).
+    # Expert offline data still uses sparse +1 only at terminal chunk.
+    # Start the server first:
+    #   cd ~/Documents/niu/Robometer && uv run python robometer/evals/eval_server.py \
+    #     model_path=robometer/Robometer-4B server_url=0.0.0.0 server_port=8000 num_gpus=1 batch_size=4
+    use_robometer_reward           = True,
+    robometer_server_url           = "http://127.0.0.1:8000",
+    robometer_task_instruction     = "Pick up the Arizona bottle and place it in the target location.",
+    robometer_reward_weight        = 1.0,
+    robometer_max_frames           = 16,
+    robometer_use_frame_steps      = False,
+    robometer_request_timeout_s    = 120.0,
     hire_reward_weight             = 1.0,    # scales Φ
     hire_contrastive_lambda        = 0.1,    # 0 = disable negative term, Φ(s) = reward_weight · sim_pos only
     hire_logsumexp_beta_pos        = 10.0,   # SHARP max over positives

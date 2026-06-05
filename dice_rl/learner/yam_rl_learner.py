@@ -112,6 +112,14 @@ class YAMRLLearner:
         #   False (default) — online success uses HiRE shaped reward (full method)
         #   True            — online success reverts to sparse reward (offline-style)
         use_sparse_for_online_success: bool = False,
+        # Robometer — raw per-frame progress prediction as online reward
+        use_robometer_reward: bool = False,
+        robometer_server_url: str = "http://127.0.0.1:8000",
+        robometer_task_instruction: str = "",
+        robometer_reward_weight: float = 1.0,
+        robometer_max_frames: int = 16,
+        robometer_use_frame_steps: bool = False,
+        robometer_request_timeout_s: float = 120.0,
         # ZMQ
         network_server_endpoint: str = "ipc:///tmp/feeds/rl_weights",
         network_weight_topic: str = "rl_network_weights_topic",
@@ -202,8 +210,30 @@ class YAMRLLearner:
 
         # ---- HiRE reward shaper (optional) ----
         self.use_hire_reward = use_hire_reward
+        self.use_robometer_reward = use_robometer_reward
         self.use_sparse_for_online_success = use_sparse_for_online_success
         self.hire_shaper = None
+        self.robometer_shaper = None
+        if self.use_hire_reward and self.use_robometer_reward:
+            raise ValueError("use_hire_reward and use_robometer_reward are mutually exclusive")
+        if self.use_robometer_reward:
+            from dice_rl.reward.robometer_shaper import RobometerRawProgressShaper
+            if not robometer_task_instruction:
+                raise ValueError("robometer_task_instruction is required when use_robometer_reward=True")
+            log.info("Robometer enabled — online reward = w * progress(s_{t+H}), expert stays sparse")
+            self.robometer_shaper = RobometerRawProgressShaper(
+                server_url=robometer_server_url,
+                task_instruction=robometer_task_instruction,
+                reward_weight=robometer_reward_weight,
+                max_frames=robometer_max_frames,
+                use_frame_steps=robometer_use_frame_steps,
+                request_timeout_s=robometer_request_timeout_s,
+            )
+            if not self.robometer_shaper.is_ready():
+                raise RuntimeError(
+                    f"Robometer server unreachable at {robometer_server_url} — "
+                    "start the eval server first (see Robometer README)"
+                )
         if self.use_hire_reward:
             from dice_rl.reward.hire_shaper import DinoV2Encoder, HireRewardShaper
             log.info("HiRE enabled — building DINOv2 encoder + contrastive PBRS shaper")
@@ -257,6 +287,7 @@ class YAMRLLearner:
             action_horizon=action_horizon,
             device=device,
             hire_shaper=self.hire_shaper,
+            robometer_shaper=self.robometer_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
             expert_curation_path=hire_expert_curation_path,  # use 24 curated episodes for RL training
                                                               # (same JSON as HiRE positive buffer above)

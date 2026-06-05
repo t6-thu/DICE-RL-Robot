@@ -68,6 +68,7 @@ class YAMReplayBuffer:
         max_online_size: int = 50_000,
         device: str = "cuda",
         hire_shaper=None,
+        robometer_shaper=None,
         use_sparse_for_online_success: bool = False,
         expert_curation_path: Optional[str] = None,
     ) -> None:
@@ -78,6 +79,12 @@ class YAMReplayBuffer:
         # Optional HiRE reward shaper: if provided and `is_ready()` is True,
         # episodes' sparse rewards get PBRS dense shaping applied at insertion.
         self.hire_shaper = hire_shaper
+        # Optional Robometer reward source (mutually exclusive with HiRE):
+        # if provided and ready, online per-transition reward becomes raw
+        # progress(s_{t+H}) instead of the sparse / shaped recipe.
+        self.robometer_shaper = robometer_shaper
+        if hire_shaper is not None and robometer_shaper is not None:
+            raise ValueError("hire_shaper and robometer_shaper are mutually exclusive")
         # Switch: when True, batches sampled from online SUCCESS episodes use the
         # original sparse reward instead of the HiRE-shaped one. Online failure
         # episodes always use the shaped reward. Offline expert demos use a
@@ -189,7 +196,9 @@ class YAMReplayBuffer:
         # HiRE PBRS shaping with H-step lookahead:
         #   r̃_t = R_sparse[t+H] + γ·Φ(s_{t+H}) − Φ(s_t)
         # Terminal boundary: Φ(s_{T-1}) = 0 (last frame of episode).
-        if self.hire_shaper is not None and self.hire_shaper.is_ready():
+        if self.robometer_shaper is not None and self.robometer_shaper.is_ready():
+            R_shaped_tr = self.robometer_shaper.shape_rewards(I, horizon=H)
+        elif self.hire_shaper is not None and self.hire_shaper.is_ready():
             R_shaped_tr = self.hire_shaper.shape_rewards(R_sparse, I, horizon=H)
         else:
             # Fallback: use sparse reward at t+H with no shaping.
