@@ -385,9 +385,13 @@ class YAMRLEnvRunner:
                 continue
 
             # Save episode to disk (survives learner/runner crashes).
+            # Images stored as uint8 [0,255] for compact storage (~4× smaller
+            # than float32, matches what RealSense produces natively).
+            # replay_buffer._make_obs and hire_shaper auto-detect dtype and
+            # convert back to float32 [0,1] on load.
             ep_path = os.path.join(self.online_data_dir, f"episode_{ep:04d}.npz")
             np.savez_compressed(ep_path,
-                                images=ep_data["images"],
+                                images=(ep_data["images"] * 255.0).clip(0, 255).astype(np.uint8),
                                 states=ep_data["states"],
                                 actions=ep_data["actions"],
                                 rewards=ep_data["rewards"],

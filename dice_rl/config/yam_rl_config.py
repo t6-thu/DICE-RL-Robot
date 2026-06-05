@@ -111,7 +111,9 @@ NORM_NPZ   = os.path.join(_data_dir,
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
 #   ~/data/real_processed/yam_rl_rollouts_<RUN_NAME>/      ← online episodes
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
-RUN_NAME        = "finestride_chunkplusH_curated"
+# For Robometer-only reward runs, use a distinct name, e.g.:
+#   RUN_NAME = "robometer_libero_w1"
+RUN_NAME        = "chunkplusH_curated_2000_1000"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -147,8 +149,8 @@ TRAINING = dict(
     # One training round per 10 new rollouts.
 
     gradient_steps                     = 2000,
-    # 2000 actor+critic updates per training round.
-    # Effective data: 2000 × 256 = 512k transitions per round.
+    # First round: 2000 grad steps. Subsequent rounds: 1000 (= gradient_steps // 2).
+    # First round needs more since 20 warmup eps must be absorbed; later rounds only see 10 new eps.
 
     # --- Batch composition ---
     batch_size  = 256,       # 128 expert + 128 online per step
@@ -194,7 +196,36 @@ TRAINING = dict(
     # similar to failure modes?"). Combined with a small contrastive λ=0.1,
     # this lets positives drive most of the signal while negatives gently push
     # the policy away from common failure patterns.
+    # --- Reward source (enable exactly one dense shaper) ---
+    # HiRE: contrastive DINO PBRS (default in this repo).
     use_hire_reward                = True,
+    # Robometer-4B: LIBERO-style progress PBRS via HTTP eval server (HiRE-Dice_RL
+    # ``launch_mimicgen_ft_robometer.sh`` analogue). Expert buffer stays sparse.
+    use_robometer_reward           = False,
+    robometer_server_url           = "http://127.0.0.1:8000",
+    robometer_task_instruction     = (
+        "Pick up the Arizona bottle and place it in the target location."
+    ),
+    robometer_reward_weight        = 1.0,
+    # Camera for Robometer VLM only (policy still uses rgb_0 + rgb_1).
+    # Maps to episode images[:, :3] (base) or [:, 3:] (wrist). Default "base" = rgb_0.
+    # HiRE-Dice sideview_image / agentview_image → use "base" on YAM unless you
+    # intentionally want wrist progress, then "wrist".
+    robometer_camera               = "base",
+    robometer_use_frame_steps      = False,
+    robometer_max_frames           = 16,
+    robometer_request_timeout_s    = 120.0,
+    # RealSense rgb8 is already RGB; keep False (HiRE-Dice sim uses True for robosuite BGR).
+    robometer_bgr_to_rgb           = False,
+    # LIBERO default for dense reward: weight * (progress_t - progress_{t-1}).
+    # On YAM transitions: weight * (progress_{t+H} - progress_t).
+    robometer_use_relative_rewards = True,
+    robometer_gamma_pbrs           = 0.99,   # only used when use_relative_rewards=False
+    # HiRE-Dice FINETUNE_GLOBAL_OVERRIDES equivalents (learner-side, per episode):
+    robometer_query_every_n_chunks = 4,
+    robometer_query_fill_mode      = "hold",
+    robometer_max_batch_size       = 4,
+
     hire_reward_weight             = 1.0,    # scales Φ
     hire_contrastive_lambda        = 0.1,    # 0 = disable negative term, Φ(s) = reward_weight · sim_pos only
     hire_logsumexp_beta_pos        = 10.0,   # SHARP max over positives
@@ -237,13 +268,32 @@ NETWORK = dict(
 )
 
 # ============================================================
+# Cameras (RealSense serials + logical names used in code)
+# ============================================================
+# YAM RL stores each frame as images[t] shape (6, H, W):
+#   channels 0:3  ← base / fixed third-person  → policy key rgb_0, env_runner base_cam
+#   channels 3:6  ← wrist                     → policy key rgb_1, env_runner wrist_cam
+#
+# HiRE-Dice_RL (sim) uses robometer_camera_key in {agentview_image, sideview_image, ...}.
+# On real YAM the analogue is robometer_camera in {base, wrist} (or rgb_0, rgb_1).
+# Default for Robometer progress: "base" (= rgb_0), same stream the BC policy uses as
+# the primary fixed camera — NOT the wrist view.
+CAMERAS = dict(
+    base_cam_serial  = "218622278369",
+    wrist_cam_serial = "218622271309",
+    width            = 640,
+    height           = 480,
+    fps              = 30,
+)
+
+# ============================================================
 # Hardware
 # ============================================================
 HARDWARE = dict(
     can_channel       = "can_follower_l",
     gripper_type      = "linear_4310",
-    base_cam_serial   = "218622278369",
-    wrist_cam_serial  = "218622271309",
+    base_cam_serial   = CAMERAS["base_cam_serial"],
+    wrist_cam_serial  = CAMERAS["wrist_cam_serial"],
     home_joint_pos    = [-0.010, 0.833, 0.903, -0.598, -0.028, -0.029],
     home_gripper_pos  = 1.0,
     control_hz        = 30.0,

@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO,
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from dice_rl.config.yam_env_overrides import apply_hardware_env_overrides
 from dice_rl.config.yam_rl_config import (
     BC_POLICY_CKPT, NORM_NPZ, ONLINE_DATA_DIR, RL_CKPT_DIR,
     TRAINING, HARDWARE, NETWORK, COMM,
@@ -35,7 +36,7 @@ runner = YAMRLEnvRunner(
     obs_horizon            = TRAINING["obs_horizon"],
     action_horizon         = TRAINING["action_horizon"],
     action_dim             = TRAINING["action_dim"],
-    **HARDWARE,
+    **apply_hardware_env_overrides(HARDWARE),
     **COMM,
 )
 runner.run()

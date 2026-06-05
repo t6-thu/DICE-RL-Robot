@@ -62,7 +62,7 @@ class YAMRLLearner:
         critic_hidden_dims: list = None,
         # Training
         num_episodes_before_first_training: int = 20,
-        gradient_steps: int = 2000,
+        gradient_steps: int = 2000,        # used on first round; subsequent rounds use gradient_steps // 2
         update_every_x_episode: int = 10,
         batch_size: int = 256,
         obs_horizon: int = 2,
@@ -93,6 +93,21 @@ class YAMRLLearner:
         q_filtering_warmup_steps: int = 25000,
         # HiRE — Hindsight Reward Editing (contrastive + PBRS dense reward)
         use_hire_reward: bool = False,
+        # Robometer-4B — LIBERO-style progress reward (mutually exclusive with HiRE)
+        use_robometer_reward: bool = False,
+        robometer_server_url: str = "http://127.0.0.1:8000",
+        robometer_task_instruction: str = "",
+        robometer_reward_weight: float = 1.0,
+        robometer_camera: str = "base",
+        robometer_use_frame_steps: bool = False,
+        robometer_max_frames: int = 16,
+        robometer_request_timeout_s: float = 120.0,
+        robometer_bgr_to_rgb: bool = False,
+        robometer_use_relative_rewards: bool = True,
+        robometer_gamma_pbrs: float = 0.99,
+        robometer_query_every_n_chunks: int = 1,
+        robometer_query_fill_mode: str = "hold",
+        robometer_max_batch_size: int = 4,
         hire_init_dir: str = None,                # past online episodes to seed pos/neg
         hire_expert_curation_path: str = None,    # JSON listing which expert eps to include
         hire_reward_weight: float = 1.0,
@@ -123,6 +138,7 @@ class YAMRLLearner:
     ) -> None:
         self.device = torch.device(device)
         self.gradient_steps = gradient_steps
+        self.gradient_steps_subsequent = gradient_steps // 2  # rounds 2+ use half the steps
         self.update_every_x_episode = update_every_x_episode
         self.num_episodes_before_first_training = num_episodes_before_first_training
         self.batch_size = batch_size
@@ -200,11 +216,44 @@ class YAMRLLearner:
             [p for c in self.critics for p in c.parameters()], lr=critic_lr
         )
 
-        # ---- HiRE reward shaper (optional) ----
+        # ---- Reward shaper (HiRE or Robometer; not both) ----
         self.use_hire_reward = use_hire_reward
+        self.use_robometer_reward = use_robometer_reward
         self.use_sparse_for_online_success = use_sparse_for_online_success
         self.hire_shaper = None
-        if self.use_hire_reward:
+        self.robometer_shaper = None
+        if self.use_hire_reward and self.use_robometer_reward:
+            raise ValueError(
+                "use_hire_reward and use_robometer_reward are mutually exclusive"
+            )
+        if self.use_robometer_reward:
+            from dice_rl.reward.robometer_episode_shaper import (
+                RobometerEpisodeRewardShaper,
+            )
+            if not robometer_task_instruction:
+                raise ValueError(
+                    "robometer_task_instruction is required when use_robometer_reward=True"
+                )
+            log.info(
+                "Robometer enabled — online rewards from server %s (expert stays sparse)",
+                robometer_server_url,
+            )
+            self.robometer_shaper = RobometerEpisodeRewardShaper(
+                server_url=robometer_server_url,
+                task_instruction=robometer_task_instruction,
+                reward_weight=robometer_reward_weight,
+                camera=robometer_camera,
+                use_frame_steps=robometer_use_frame_steps,
+                max_frames=robometer_max_frames,
+                request_timeout_s=robometer_request_timeout_s,
+                bgr_to_rgb=robometer_bgr_to_rgb,
+                use_relative_rewards=robometer_use_relative_rewards,
+                gamma_pbrs=robometer_gamma_pbrs,
+                query_every_n_chunks=robometer_query_every_n_chunks,
+                query_fill_mode=robometer_query_fill_mode,
+                max_batch_size=robometer_max_batch_size,
+            )
+        elif self.use_hire_reward:
             from dice_rl.reward.hire_shaper import DinoV2Encoder, HireRewardShaper
             log.info("HiRE enabled — building DINOv2 encoder + contrastive PBRS shaper")
             _dino = DinoV2Encoder(device=device)
@@ -257,6 +306,7 @@ class YAMRLLearner:
             action_horizon=action_horizon,
             device=device,
             hire_shaper=self.hire_shaper,
+            robometer_shaper=self.robometer_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
             expert_curation_path=hire_expert_curation_path,  # use 24 curated episodes for RL training
                                                               # (same JSON as HiRE positive buffer above)
@@ -327,7 +377,7 @@ class YAMRLLearner:
                     (self.total_episodes - self.num_episodes_before_first_training)
                     // self.update_every_x_episode + 1
                 )
-                done_rounds = self.total_gradient_steps // self.gradient_steps
+                done_rounds = self._done_rounds()
                 if expected_rounds > done_rounds:
                     self._log_success_rate()
                     log.info("Training round (episode %d): expected=%d done=%d → training…",
@@ -394,6 +444,18 @@ class YAMRLLearner:
         log.info("=" * 55)
         self._recent_outcomes.clear()
 
+    def _done_rounds(self) -> int:
+        """Number of training rounds completed. First round takes `gradient_steps`
+        steps; subsequent rounds take `gradient_steps // 2` steps each."""
+        g = int(self.total_gradient_steps)
+        if g < self.gradient_steps:
+            return 0
+        return 1 + (g - self.gradient_steps) // self.gradient_steps_subsequent
+
+    def _round_steps(self) -> int:
+        """Steps for the upcoming round. Round 1 = gradient_steps, rounds 2+ = half."""
+        return self.gradient_steps if self._done_rounds() == 0 else self.gradient_steps_subsequent
+
     def _train_round(self) -> None:
         """Run gradient_steps updates with pre-encoded feature + multi-K BC pool.
 
@@ -403,8 +465,9 @@ class YAMRLLearner:
           - K_critic=4 (noise, BC) pairs for next_obs    → multi-sample target Q
         """
         er = self._current_expert_ratio()
+        steps_this_round = self._round_steps()
 
-        pool_size  = min(self.gradient_steps * self.batch_size, 10_000)
+        pool_size  = min(steps_this_round * self.batch_size, 10_000)
         encode_bs  = 128                                   # smaller because K-expansion below
         K_actor    = self.num_multi_z_for_actor_loss       # 8
         K_critic   = self.num_next_noise_samples           # 4
@@ -479,9 +542,9 @@ class YAMRLLearner:
         pool_done         = torch.cat(done_list)            # (N, 1)
         pool_is_expert    = torch.cat(is_expert_list)       # (N, 1)
         N = pool_feat.shape[0]
-        log.info("Pool ready. Running %d MLP-only gradient steps…", self.gradient_steps)
+        log.info("Pool ready. Running %d MLP-only gradient steps…", steps_this_round)
 
-        for step in range(self.gradient_steps):
+        for step in range(steps_this_round):
             idx = torch.randint(0, N, (self.batch_size,), device=self.device)
             feat         = pool_feat[idx]
             feat_next    = pool_feat_next[idx]
@@ -500,10 +563,10 @@ class YAMRLLearner:
             self._update_target_critics()
             self.total_gradient_steps += 1
 
-            if step % 200 == 0 or step == self.gradient_steps - 1:
+            if step % 200 == 0 or step == steps_this_round - 1:
                 log.info("  [step %5d/%5d] critic_loss=%.4f  actor_loss=%.4f  "
                          "expert_ratio=%.2f",
-                         step, self.gradient_steps, c_loss, a_loss, er)
+                         step, steps_this_round, c_loss, a_loss, er)
 
         if self.rl_checkpoint_dir:
             self._save_checkpoint()
