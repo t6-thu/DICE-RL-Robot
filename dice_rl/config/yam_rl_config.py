@@ -113,7 +113,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
 # For Robometer-only reward runs, use a distinct name, e.g.:
 #   RUN_NAME = "robometer_libero_w1"
-RUN_NAME        = "chunkplusH_curated_2000_1000"
+RUN_NAME        = "sparse_only_2000_1000"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -198,7 +198,11 @@ TRAINING = dict(
     # the policy away from common failure patterns.
     # --- Reward source (enable exactly one dense shaper) ---
     # HiRE: contrastive DINO PBRS (default in this repo).
-    use_hire_reward                = True,
+    # When both use_hire_reward and use_robometer_reward are False, the replay
+    # buffer falls back to pure sparse reward: r=1 only at the terminal success
+    # frame (R_sparse[t+H] at t=T-H-1), r=0 everywhere else. No shaping is
+    # applied; the expert buffer is sparse by construction (anchor at last t).
+    use_hire_reward                = False,
     # Robometer-4B: LIBERO-style progress PBRS via HTTP eval server (HiRE-Dice_RL
     # ``launch_mimicgen_ft_robometer.sh`` analogue). Expert buffer stays sparse.
     use_robometer_reward           = False,
