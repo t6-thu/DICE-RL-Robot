@@ -251,9 +251,21 @@ class YAMRLEnvRunner:
 
     def run_episode(self) -> dict:
         """Execute one episode. Returns {images, states, actions, rewards, dones}."""
-        # pre-fill history
+        # pre-fill history. Cameras (esp. the USB-2 wrist sharing a hub with the
+        # CAN adapter) can intermittently return None; retry for up to 5s instead
+        # of crashing the whole run on a single dropped frame.
         q0 = self._read_state()
         b, _ = self.base_cam.get(); w, _ = self.wrist_cam.get()
+        deadline = time.monotonic() + 5.0
+        while (b is None or w is None) and time.monotonic() < deadline:
+            time.sleep(0.05)
+            b, _ = self.base_cam.get(); w, _ = self.wrist_cam.get()
+        if b is None or w is None:
+            raise RuntimeError(
+                "camera frames unavailable after 5s "
+                f"(base={'ok' if b is not None else 'None'}, "
+                f"wrist={'ok' if w is not None else 'None'}) — "
+                "check USB connection / move wrist cam to a USB-3 port")
         b = _preprocess(b); w = _preprocess(w)
         img0 = np.concatenate([b, w], axis=0)  # (6, 224, 224)
         state_hist = deque([q0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)

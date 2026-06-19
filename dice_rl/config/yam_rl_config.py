@@ -113,7 +113,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
 # For Robometer-only reward runs, use a distinct name, e.g.:
 #   RUN_NAME = "robometer_libero_w1"
-RUN_NAME        = "chunkplusH_curated_2000_1000"
+RUN_NAME        = "robometer_2000_1000"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -198,13 +198,13 @@ TRAINING = dict(
     # the policy away from common failure patterns.
     # --- Reward source (enable exactly one dense shaper) ---
     # HiRE: contrastive DINO PBRS (default in this repo).
-    use_hire_reward                = True,
+    use_hire_reward                = False,
     # Robometer-4B: LIBERO-style progress PBRS via HTTP eval server (HiRE-Dice_RL
     # ``launch_mimicgen_ft_robometer.sh`` analogue). Expert buffer stays sparse.
-    use_robometer_reward           = False,
+    use_robometer_reward           = True,
     robometer_server_url           = "http://127.0.0.1:8000",
     robometer_task_instruction     = (
-        "Pick up the Arizona bottle and place it in the target location."
+        "Pick up the Arizona bottle and place it on the plate."
     ),
     robometer_reward_weight        = 1.0,
     # Camera for Robometer VLM only (policy still uses rgb_0 + rgb_1).
