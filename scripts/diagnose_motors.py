@@ -56,7 +56,7 @@ def main():
     print("[diag] at home. starting monitor …")
 
     # baseline temps
-    t0_state = robot.get_motor_states()
+    t0_state = robot.motor_chain.read_states()
     baseline_mos    = np.array([m.temp_mos    for m in t0_state])
     baseline_rotor  = np.array([m.temp_rotor  for m in t0_state])
     print(f"[diag] baseline temps: mos={baseline_mos.tolist()}  rotor={baseline_rotor.tolist()}")
@@ -94,7 +94,7 @@ def main():
 
         # Read state + check.
         try:
-            states = robot.get_motor_states()
+            states = robot.motor_chain.read_states()
         except Exception as e:
             print(f"[diag t={t:.0f}s]  ❌  read exception: {e}")
             n_motor_err += 1
