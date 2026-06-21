@@ -24,6 +24,9 @@ _p = argparse.ArgumentParser()
 _p.add_argument("--residual-scale", type=float, default=1.0,
                 help="Scale on the RL residual (0=pure BC, 1=full RL). "
                      "Use 0.0 to A/B-test pure BC, or 0.3 for a softer RL effect.")
+_p.add_argument("--max-joint-step", type=float, default=0.08,
+                help="Max absolute change per 30 Hz command per joint/gripper. "
+                     "Use smaller values (0.04-0.06) when debugging motor loss.")
 _args, _ = _p.parse_known_args()
 
 runner = YAMRLEnvRunner(
@@ -33,6 +36,7 @@ runner = YAMRLEnvRunner(
     rl_checkpoint_dir      = RL_CKPT_DIR,
     actor_hidden_dims      = NETWORK["actor_hidden_dims"],
     residual_scale         = _args.residual_scale,
+    max_joint_step         = _args.max_joint_step,
     obs_horizon            = TRAINING["obs_horizon"],
     action_horizon         = TRAINING["action_horizon"],
     action_dim             = TRAINING["action_dim"],

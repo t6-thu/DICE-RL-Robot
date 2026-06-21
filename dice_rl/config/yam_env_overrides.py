@@ -86,6 +86,31 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def apply_learner_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay learner resource knobs from env vars.
+
+    These are intentionally separate from reward selection. They let a single
+    workstation run Robometer + learner without building a huge pre-encoded
+    training pool that can trigger desktop-wide OOM.
+    """
+    out = dict(training)
+    mapping = {
+        "gradient_steps": ("YAM_LEARNER_GRADIENT_STEPS",),
+        "batch_size": ("YAM_LEARNER_BATCH_SIZE",),
+        "num_next_noise_samples": ("YAM_LEARNER_K_CRITIC",),
+        "num_multi_z_for_actor_loss": ("YAM_LEARNER_K_ACTOR",),
+        "training_pool_size_limit": ("YAM_LEARNER_POOL_SIZE_LIMIT",),
+        "training_encode_batch_size": ("YAM_LEARNER_ENCODE_BATCH_SIZE",),
+        "bc_pool_inference_steps": ("YAM_LEARNER_BC_POOL_INFERENCE_STEPS",),
+    }
+    for key, env_names in mapping.items():
+        for en in env_names:
+            if os.environ.get(en) not in (None, ""):
+                out[key] = int(os.environ[en])
+                break
+    return out
+
+
 def apply_hardware_env_overrides(hardware: Dict[str, Any]) -> Dict[str, Any]:
     """RealSense serials and capture size from env (robot PC)."""
     out = dict(hardware)

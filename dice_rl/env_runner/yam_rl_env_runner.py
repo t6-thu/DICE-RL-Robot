@@ -63,18 +63,51 @@ class _SyncCamera:
     def __init__(self, serial, w, h, fps, name):
         self.serial, self.width, self.height, self.fps, self.name = serial, w, h, fps, name
         self._pipe, self._latest, self._t = None, None, 0.0
+
+    def _usb_type(self):
+        try:
+            import pyrealsense2 as rs
+            ctx = rs.context()
+            for dev in ctx.query_devices():
+                if dev.get_info(rs.camera_info.serial_number) == self.serial:
+                    return dev.get_info(rs.camera_info.usb_type_descriptor)
+        except Exception:
+            pass
+        return "unknown"
+
     def start(self):
         import pyrealsense2 as rs
+        usb = self._usb_type()
+        if not str(usb).startswith("3"):
+            log.warning(
+                "camera %s (%s) is on USB=%s; D405 should use USB3 for reliable streaming",
+                self.name, self.serial, usb)
         p = rs.pipeline(); c = rs.config()
         c.enable_device(self.serial)
         c.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         p.start(c)
-        try:
-            f = p.wait_for_frames(timeout_ms=2000)
-            self._latest = np.asanyarray(f.get_color_frame().get_data())
-            self._t = time.monotonic()
-        except Exception: pass
         self._pipe = p
+        # USB-2 cameras (the wrist D405 enumerates at USB 2.1) can take several
+        # seconds and a few retries before the first frame arrives after a fresh
+        # pipeline start. Retry up to ~12s instead of giving up after one 2s wait,
+        # so env_runner startup doesn't crash on a slow-to-stream wrist cam.
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            try:
+                f = p.wait_for_frames(timeout_ms=2000)
+                cf = f.get_color_frame()
+                if cf:
+                    self._latest = np.asanyarray(cf.get_data())
+                    self._t = time.monotonic()
+                    return
+            except Exception:
+                time.sleep(0.3)
+        self.stop()
+        raise RuntimeError(
+            f"camera {self.name} ({self.serial}) produced no frame within 12s "
+            f"at {self.width}x{self.height}@{self.fps} rgb8; USB={usb}. "
+            "Check cable/port and make sure it enumerates as USB3."
+        )
     def get(self):
         if not self._pipe: return None, 0.0
         try:
@@ -118,6 +151,7 @@ class YAMRLEnvRunner:
         # Actor (residual RL)
         actor_hidden_dims: list = None,
         residual_scale: float = 1.0,  # scale on actor's delta — set <1 to soften RL effect
+        max_joint_step: float = 0.08,
         # Data & ZMQ
         online_data_dir: str = "/tmp/yam_rl_rollouts",
         rl_checkpoint_dir: str = None,
@@ -139,6 +173,7 @@ class YAMRLEnvRunner:
                                        dtype=np.float32)
         self.home_gripper_pos = home_gripper_pos
         self.residual_scale = float(residual_scale)
+        self.max_joint_step = float(max_joint_step)
         self._last_delta_rms = 0.0
         self.online_data_dir = online_data_dir
         self.rl_checkpoint_dir = rl_checkpoint_dir
@@ -147,6 +182,9 @@ class YAMRLEnvRunner:
         )
         self._last_weights_mtime = 0.0
         os.makedirs(online_data_dir, exist_ok=True)
+        log.info(
+            "Env runner control: control_hz=%.1f residual_scale=%.3f max_joint_step=%.3f",
+            self.control_hz, self.residual_scale, self.max_joint_step)
 
         # ---- normalisation ----
         n = np.load(norm_npz_path)
@@ -177,16 +215,32 @@ class YAMRLEnvRunner:
         torch.cuda.synchronize()
         log.info("GPU warmup done.")
 
-        # ---- hardware ----
-        from i2rt.robots.get_robot import get_yam_robot, GripperType
-        self.robot = get_yam_robot(channel=can_channel,
-                                   gripper_type=GripperType.from_string_name(gripper_type),
-                                   zero_gravity_mode=True)
+        # ---- cameras ----
+        # Validate cameras before touching the robot. If a RealSense cable/port
+        # is bad, fail here instead of calibrating the gripper and leaving robot
+        # background control threads running after startup aborts.
+        self.robot = None
         self.base_cam  = _SyncCamera(base_cam_serial,  640, 480, 30, "base")
         self.wrist_cam = _SyncCamera(wrist_cam_serial, 640, 480, 30, "wrist")
-        self.base_cam.start(); self.wrist_cam.start()
+        try:
+            self.base_cam.start(); self.wrist_cam.start()
+        except Exception:
+            self.base_cam.stop()
+            self.wrist_cam.stop()
+            raise
         time.sleep(1.0)
         log.info("Cameras streaming.")
+
+        # ---- hardware ----
+        from i2rt.robots.get_robot import get_yam_robot, GripperType
+        try:
+            self.robot = get_yam_robot(channel=can_channel,
+                                       gripper_type=GripperType.from_string_name(gripper_type),
+                                       zero_gravity_mode=True)
+        except Exception:
+            self.base_cam.stop()
+            self.wrist_cam.stop()
+            raise
 
         # ---- ZMQ ----
         self.actor_node = Actor(
@@ -270,6 +324,7 @@ class YAMRLEnvRunner:
         img0 = np.concatenate([b, w], axis=0)  # (6, 224, 224)
         state_hist = deque([q0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
         img_hist   = deque([img0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
+        last_cmd = q0.astype(np.float64).copy()
 
         images_rec, states_rec, actions_rec, rewards_rec = [], [], [], []
         self._abort_episode["flag"] = False
@@ -319,12 +374,19 @@ class YAMRLEnvRunner:
                 q_cmd = np.clip(q_tgt.astype(np.float64),
                                 [-2.767,-0.15,-0.15,-1.72,-1.72,-2.24,0.],
                                 [ 3.28,  3.80, 3.28, 1.72, 1.72, 2.24,1.5])
+                if self.max_joint_step > 0:
+                    q_cmd = np.clip(
+                        q_cmd,
+                        last_cmd - self.max_joint_step,
+                        last_cmd + self.max_joint_step,
+                    )
                 self.robot.command_joint_pos(q_cmd)
+                last_cmd = q_cmd.copy()
                 q_cur = self._read_state()
 
                 # update obs history at 30 Hz
                 br, _ = self.base_cam.get(); wr, _ = self.wrist_cam.get()
-                if br is not None:
+                if br is not None and wr is not None:
                     b_p = _preprocess(br); w_p = _preprocess(wr)
                     img_cur = np.concatenate([b_p, w_p], axis=0)
                     state_hist.append(q_cur.copy())
@@ -333,7 +395,7 @@ class YAMRLEnvRunner:
                 # Record one raw single-step action per inner step.
                 images_rec.append(img_hist[-1].copy())
                 states_rec.append(self.state_norm.normalize(state_hist[-1]))
-                actions_rec.append(self.action_norm.normalize(q_tgt))  # (7,)
+                actions_rec.append(self.action_norm.normalize(q_cmd))  # (7,)
 
             log.info("[step %3d] infer=%.1fms skip=%d delta_rms=%.3f q=%s",
                      step, infer_ms, skip_steps, self._last_delta_rms,

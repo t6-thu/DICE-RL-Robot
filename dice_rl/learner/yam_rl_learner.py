@@ -65,6 +65,9 @@ class YAMRLLearner:
         gradient_steps: int = 2000,        # used on first round; subsequent rounds use gradient_steps // 2
         update_every_x_episode: int = 10,
         batch_size: int = 256,
+        training_pool_size_limit: int = 10_000,
+        training_encode_batch_size: int = 128,
+        bc_pool_inference_steps: int = 8,
         obs_horizon: int = 2,
         action_horizon: int = 16,
         action_dim: int = 7,
@@ -142,6 +145,9 @@ class YAMRLLearner:
         self.update_every_x_episode = update_every_x_episode
         self.num_episodes_before_first_training = num_episodes_before_first_training
         self.batch_size = batch_size
+        self.training_pool_size_limit = int(training_pool_size_limit)
+        self.training_encode_batch_size = int(training_encode_batch_size)
+        self.bc_pool_inference_steps = int(bc_pool_inference_steps)
         self.obs_horizon = obs_horizon
         self.action_horizon = action_horizon
         self.action_dim = action_dim
@@ -360,6 +366,9 @@ class YAMRLLearner:
         log.info("  gradient_steps per round           = %d", self.gradient_steps)
         log.info("  batch_size (expert+online)         = %d  (expert_ratio=%.1f%%)",
                  self.batch_size, self.expert_ratio * 100)
+        log.info("  training_pool_size_limit           = %d", self.training_pool_size_limit)
+        log.info("  training_encode_batch_size         = %d", self.training_encode_batch_size)
+        log.info("  bc_pool_inference_steps            = %d", self.bc_pool_inference_steps)
         log.info("  starting at total_episodes=%d, total_gradient_steps=%d",
                  self.total_episodes, self.total_gradient_steps)
 
@@ -467,8 +476,9 @@ class YAMRLLearner:
         er = self._current_expert_ratio()
         steps_this_round = self._round_steps()
 
-        pool_size  = min(steps_this_round * self.batch_size, 10_000)
-        encode_bs  = 128                                   # smaller because K-expansion below
+        pool_size  = min(steps_this_round * self.batch_size,
+                         max(1, self.training_pool_size_limit))
+        encode_bs  = max(1, self.training_encode_batch_size)
         K_actor    = self.num_multi_z_for_actor_loss       # 8
         K_critic   = self.num_next_noise_samples           # 4
 
@@ -483,7 +493,7 @@ class YAMRLLearner:
         # rl_num_inference_steps=8 (vs 16 used at deployment). 2× faster pool.
         _orig_inf_steps = getattr(self.bc_policy, "num_inference_steps", None)
         if _orig_inf_steps is not None:
-            self.bc_policy.num_inference_steps = 8
+            self.bc_policy.num_inference_steps = self.bc_pool_inference_steps
 
         n = 0
         while n < pool_size:

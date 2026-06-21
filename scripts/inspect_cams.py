@@ -30,16 +30,20 @@ def list_devices():
     ctx = rs.context()
     devs = list(ctx.query_devices())
     print(f"=== {len(devs)} RealSense device(s) detected ===")
+    usb_by_serial = {}
     for d in devs:
         try:
             sn   = d.get_info(rs.camera_info.serial_number)
             name = d.get_info(rs.camera_info.name)
             usb  = d.get_info(rs.camera_info.usb_type_descriptor)
             fw   = d.get_info(rs.camera_info.firmware_version)
+            usb_by_serial[sn] = usb
             print(f"  serial={sn}  {name}  USB={usb}  fw={fw}")
+            if not str(usb).startswith("3"):
+                print(f"    WARNING: {sn} is not on USB3; D405 color streaming may fail.")
         except Exception as e:
             print(f"  (could not read all info: {e})")
-    return [d.get_info(rs.camera_info.serial_number) for d in devs]
+    return [d.get_info(rs.camera_info.serial_number) for d in devs], usb_by_serial
 
 
 def grab_one_frame(serial: str, w: int = 640, h: int = 480, fps: int = 30):
@@ -50,16 +54,32 @@ def grab_one_frame(serial: str, w: int = 640, h: int = 480, fps: int = 30):
     cfg.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
     profile = pipe.start(cfg)
     try:
-        # Warm-up: pop a few frames so auto-exposure stabilises.
+        # USB-2 cameras can take several seconds + retries before the first
+        # frame arrives. Retry up to ~12s rather than failing after one wait.
         time.sleep(1.0)
-        for _ in range(5):
-            pipe.wait_for_frames(timeout_ms=2000)
-        frames = pipe.wait_for_frames(timeout_ms=2000)
-        c = frames.get_color_frame()
-        if not c:
-            return None
-        img = np.asanyarray(c.get_data())   # (H, W, 3) RGB uint8
-        return img
+        deadline = time.monotonic() + 12.0
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                frames = pipe.wait_for_frames(timeout_ms=2000)
+                c = frames.get_color_frame()
+                if c:
+                    last = np.asanyarray(c.get_data())  # (H, W, 3) RGB uint8
+            except Exception:
+                time.sleep(0.3)
+                continue
+            # got at least one frame; pop a few more so auto-exposure settles
+            if last is not None:
+                for _ in range(5):
+                    try:
+                        frames = pipe.wait_for_frames(timeout_ms=2000)
+                        c = frames.get_color_frame()
+                        if c:
+                            last = np.asanyarray(c.get_data())
+                    except Exception:
+                        break
+                return last
+        return last
     finally:
         try: pipe.stop()
         except Exception: pass
@@ -70,7 +90,7 @@ def main():
     p.add_argument("--show", action="store_true")
     args = p.parse_args()
 
-    serials = list_devices()
+    serials, usb_by_serial = list_devices()
     cfg_base  = HARDWARE.get("base_cam_serial") if isinstance(HARDWARE, dict) else None
     cfg_wrist = HARDWARE.get("wrist_cam_serial") if isinstance(HARDWARE, dict) else None
     if cfg_base is None or cfg_wrist is None:
@@ -95,7 +115,13 @@ def main():
             print(f"[{name}] error: {e}")
             continue
         if img is None:
+            usb = usb_by_serial.get(sn, "unknown")
             print(f"[{name}] no frame received")
+            if not str(usb).startswith("3"):
+                print(
+                    f"[{name}] USB={usb}; move this D405 to a USB3 port/cable/hub, "
+                    "then rerun this script."
+                )
             continue
         bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         out = f"{name}.jpg"

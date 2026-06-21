@@ -33,7 +33,7 @@ import sys
 import cv2
 import numpy as np
 
-DEFAULT_DIR = os.path.expanduser("~/data/real_processed/yam_rl_rollouts_chunkplusH_curated_2000_1000")
+DEFAULT_DIR = os.path.expanduser("~/data/real_processed/yam_rl_rollouts_robometer_2000_1000")
 
 
 def _to_uint8_bgr(rgb_float: np.ndarray) -> np.ndarray:

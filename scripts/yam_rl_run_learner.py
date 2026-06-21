@@ -14,7 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import copy
 
 from dice_rl.config import yam_rl_config as cfg
-from dice_rl.config.yam_env_overrides import apply_robometer_env_overrides
+from dice_rl.config.yam_env_overrides import (
+    apply_learner_env_overrides,
+    apply_robometer_env_overrides,
+)
 from dice_rl.config.yam_rl_config import (
     BC_POLICY_CKPT, EXPERT_NPZ, ONLINE_DATA_DIR, NORM_NPZ, RL_CKPT_DIR,
     HIRE_INIT_DIR, HIRE_EXPERT_CURATION_PATH,
@@ -23,7 +26,9 @@ from dice_rl.config.yam_rl_config import (
 from dice_rl.learner.yam_rl_learner import YAMRLLearner
 
 # Robometer / reward toggles via env (see scripts/robometer/README.md).
-_training = apply_robometer_env_overrides(copy.deepcopy(TRAINING))
+_training = apply_learner_env_overrides(
+    apply_robometer_env_overrides(copy.deepcopy(TRAINING))
+)
 _reward_mode = os.environ.get("YAM_REWARD_MODE", "").strip().lower()
 if _reward_mode in ("hire", ""):
     pass

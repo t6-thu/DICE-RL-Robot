@@ -33,6 +33,7 @@ ENV_CORES="0-5"
 HEAVY_CORES="6-23"
 
 ROLE="$1"
+shift || true
 case "$ROLE" in
   server)
     echo "[isolated] robometer server → cores $HEAVY_CORES, nice +10, 8 threads"
@@ -49,6 +50,7 @@ case "$ROLE" in
     cd "$HERE"
     source ./prepare.sh
     exec env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 \
+      MALLOC_ARENA_MAX=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
       taskset -c "$HEAVY_CORES" nice -n 5 \
       python scripts/yam_rl_run_learner.py 2>&1 \
         | tee -a "$HOME/training_outputs/yam_rl_finetuning_$(python3 -c 'from dice_rl.config.yam_rl_config import RUN_NAME;print(RUN_NAME)')/learner.log"
@@ -58,7 +60,9 @@ case "$ROLE" in
     echo "[isolated] env_runner → cores $ENV_CORES (dedicated, real-time control protected)"
     cd "$HERE"
     source ./prepare.sh
-    exec taskset -c "$ENV_CORES" python scripts/yam_rl_run_env_runner.py
+    exec env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+      OPENCV_FOR_THREADS_NUM=1 PYTHONUNBUFFERED=1 \
+      taskset -c "$ENV_CORES" python scripts/yam_rl_run_env_runner.py "$@"
     ;;
 
   rebind)
