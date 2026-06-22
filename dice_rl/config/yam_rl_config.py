@@ -157,6 +157,14 @@ TRAINING = dict(
     obs_horizon = 2,         # must match BC training (2 frames of history)
     action_horizon = 16,     # must match BC training
     action_dim     = 7,      # YAM: 6 arm joints + 1 gripper
+    # Resource knobs for same-workstation Robometer runs.
+    training_pool_size_limit   = 10_000,
+    training_encode_batch_size = 128,
+    bc_pool_inference_steps    = 8,
+    # Keep only recent online episodes expanded in RAM. Older rollouts are
+    # represented by the resumed checkpoint; expanding every saved image window
+    # from 50+ rollouts can OOM a 64GB workstation.
+    max_online_episodes        = 12,
 
     # --- RLPD expert ratio (anneals from 70% to 20%) ---
     use_adaptive_expert_ratio   = True,
@@ -228,6 +236,14 @@ TRAINING = dict(
     # Keep robot rollout responsive: disk episode loading is cheap, but
     # Robometer HTTP scoring is deferred until the learner is about to train.
     robometer_defer_reward_until_training = True,
+    # Learner/env can stay running together. The learner starts the local
+    # Robometer server only while assigning pending rewards, then stops it
+    # before gradient training to free memory.
+    robometer_auto_start_server    = True,
+    robometer_server_launch_cmd    = "",
+    robometer_server_start_timeout_s = 240.0,
+    robometer_stop_server_after_reward = True,
+    robometer_server_log_path      = "",
 
     hire_reward_weight             = 1.0,    # scales Φ
     hire_contrastive_lambda        = 0.1,    # 0 = disable negative term, Φ(s) = reward_weight · sim_pos only

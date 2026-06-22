@@ -4,7 +4,7 @@
 DICE_REPO_ROOT="$HOME/Documents/niu/DICE-RL-Robot"
 
 # uv venv living at the repo root (see installation steps in README).
-export LD_LIBRARY_PATH="$DICE_REPO_ROOT/.venv/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$DICE_REPO_ROOT/.venv/lib:${LD_LIBRARY_PATH:-}"
 
 # where the collected raw data folders are
 export DICE_RAW_DATASET_FOLDERS=$HOME/data/real

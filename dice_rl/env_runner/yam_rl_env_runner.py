@@ -146,6 +146,7 @@ class YAMRLEnvRunner:
         # Control
         control_hz: float = 30.0,
         max_episode_steps: int = 200,
+        max_episodes: Optional[int] = None,
         obs_horizon: int = 2,
         action_horizon: int = 16,
         action_dim: int = 7,
@@ -170,6 +171,10 @@ class YAMRLEnvRunner:
         self.control_hz = control_hz
         self.period = 1.0 / control_hz
         self.max_episode_steps = max_episode_steps
+        self.max_episodes = (
+            int(max_episodes) if max_episodes is not None and int(max_episodes) > 0
+            else None
+        )
         self.home_joint_pos = np.array(home_joint_pos or [-0.01,0.833,0.903,-0.598,-0.028,-0.029],
                                        dtype=np.float32)
         self.home_gripper_pos = home_gripper_pos
@@ -188,8 +193,10 @@ class YAMRLEnvRunner:
         self._last_weights_mtime = 0.0
         os.makedirs(online_data_dir, exist_ok=True)
         log.info(
-            "Env runner control: control_hz=%.1f residual_scale=%.3f max_joint_step=%.3f",
-            self.control_hz, self.residual_scale, self.max_joint_step)
+            "Env runner control: control_hz=%.1f residual_scale=%.3f "
+            "max_joint_step=%.3f max_episodes=%s",
+            self.control_hz, self.residual_scale, self.max_joint_step,
+            self.max_episodes if self.max_episodes is not None else "unlimited")
 
         # ---- normalisation ----
         n = np.load(norm_npz_path)
@@ -450,6 +457,7 @@ class YAMRLEnvRunner:
         ep = len(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
         if ep > 0:
             log.info("Resuming: %d episodes already saved in %s", ep, self.online_data_dir)
+        collected_this_run = 0
 
         while True:
             # Do not start a robot rollout while the learner is running the
@@ -489,6 +497,11 @@ class YAMRLEnvRunner:
             self.actor_node.send_transitions(ep_data)
             log.info("Episode %d saved+sent (success=%s)", ep+1, ep_data["success"])
             ep += 1
+            collected_this_run += 1
+            if self.max_episodes is not None and collected_this_run >= self.max_episodes:
+                log.info("Collected %d episode(s) this run; exiting env runner.",
+                         collected_this_run)
+                os._exit(0)
 
     def _wait_for_learner_idle(self) -> None:
         if not self._learner_status_path:

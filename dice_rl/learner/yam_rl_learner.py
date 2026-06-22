@@ -32,8 +32,11 @@ import json
 import logging
 import os
 import pickle
+import signal
+import subprocess
 import time
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -69,6 +72,7 @@ class YAMRLLearner:
         training_pool_size_limit: int = 10_000,
         training_encode_batch_size: int = 128,
         bc_pool_inference_steps: int = 8,
+        max_online_episodes: Optional[int] = None,
         obs_horizon: int = 2,
         action_horizon: int = 16,
         action_dim: int = 7,
@@ -113,6 +117,11 @@ class YAMRLLearner:
         robometer_query_fill_mode: str = "hold",
         robometer_max_batch_size: int = 4,
         robometer_defer_reward_until_training: bool = True,
+        robometer_auto_start_server: bool = True,
+        robometer_server_launch_cmd: str = "",
+        robometer_server_start_timeout_s: float = 240.0,
+        robometer_stop_server_after_reward: bool = True,
+        robometer_server_log_path: str = "",
         hire_init_dir: str = None,                # past online episodes to seed pos/neg
         hire_expert_curation_path: str = None,    # JSON listing which expert eps to include
         hire_reward_weight: float = 1.0,
@@ -143,13 +152,20 @@ class YAMRLLearner:
     ) -> None:
         self.device = torch.device(device)
         self.gradient_steps = gradient_steps
-        self.gradient_steps_subsequent = gradient_steps // 2  # rounds 2+ use half the steps
+        # Rounds 2+ use half the first-round steps. Keep this at least 1 so
+        # small debug runs do not make the round accounting divide by zero.
+        self.gradient_steps_subsequent = max(1, gradient_steps // 2)
         self.update_every_x_episode = update_every_x_episode
         self.num_episodes_before_first_training = num_episodes_before_first_training
         self.batch_size = batch_size
         self.training_pool_size_limit = int(training_pool_size_limit)
         self.training_encode_batch_size = int(training_encode_batch_size)
         self.bc_pool_inference_steps = int(bc_pool_inference_steps)
+        self.max_online_episodes = (
+            int(max_online_episodes)
+            if max_online_episodes is not None and int(max_online_episodes) > 0
+            else None
+        )
         self.obs_horizon = obs_horizon
         self.action_horizon = action_horizon
         self.action_dim = action_dim
@@ -176,6 +192,7 @@ class YAMRLLearner:
         )
         if rl_checkpoint_dir:
             os.makedirs(rl_checkpoint_dir, exist_ok=True)
+        self._write_status("starting", "initializing learner")
 
         # ---- load frozen BC policy ----
         log.info("Loading pretrained BC policy from %s", pretrained_policy_ckpt)
@@ -234,6 +251,17 @@ class YAMRLLearner:
         self.robometer_defer_reward_until_training = bool(
             robometer_defer_reward_until_training
         )
+        self.robometer_server_url = str(robometer_server_url)
+        self.robometer_auto_start_server = bool(robometer_auto_start_server)
+        self.robometer_server_launch_cmd = str(robometer_server_launch_cmd or "")
+        self.robometer_server_start_timeout_s = float(robometer_server_start_timeout_s)
+        self.robometer_stop_server_after_reward = bool(robometer_stop_server_after_reward)
+        self.robometer_server_log_path = os.path.expanduser(
+            robometer_server_log_path
+            or "~/training_outputs/robometer_server_learner.log"
+        )
+        self._robometer_server_proc: Optional[subprocess.Popen] = None
+        self._robometer_server_log_fh = None
         self.use_sparse_for_online_success = use_sparse_for_online_success
         self.hire_shaper = None
         self.robometer_shaper = None
@@ -326,6 +354,7 @@ class YAMRLLearner:
             robometer_shaper=self.robometer_shaper,
             defer_robometer_reward=self.robometer_defer_reward_until_training,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
+            max_online_episodes=self.max_online_episodes,
             expert_curation_path=hire_expert_curation_path,  # use 24 curated episodes for RL training
                                                               # (same JSON as HiRE positive buffer above)
         )
@@ -350,7 +379,11 @@ class YAMRLLearner:
         resumed = self._maybe_resume_checkpoint()
         # Sync total_episodes from disk-restored episodes so the training trigger
         # fires at the right episode count after a restart.
-        disk_eps = self.replay_buffer._num_online_episodes
+        disk_eps = getattr(
+            self.replay_buffer,
+            "total_disk_episodes",
+            self.replay_buffer._num_online_episodes,
+        )
         if disk_eps > self.total_episodes:
             self.total_episodes = disk_eps
             log.info("Synced total_episodes=%d from disk replay buffer", self.total_episodes)
@@ -362,13 +395,21 @@ class YAMRLLearner:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
+    def run(
+        self,
+        max_training_rounds: Optional[int] = None,
+        exit_when_idle: bool = False,
+    ) -> None:
         """Main learner loop: poll disk for new episode files, train, push weights.
 
         Uses disk polling (not ZMQ) as the authoritative episode source.
         The env runner saves every episode as `episode_NNNN.npz` to
         `online_data_dir`. The learner picks them up here.
         """
+        if max_training_rounds is not None and max_training_rounds <= 0:
+            max_training_rounds = None
+        rounds_this_run = 0
+
         log.info("Learner running. Polling %s every 2 s for new episodes…",
                  self._online_data_dir)
         log.info("  num_episodes_before_first_training = %d",
@@ -381,11 +422,12 @@ class YAMRLLearner:
         log.info("  training_pool_size_limit           = %d", self.training_pool_size_limit)
         log.info("  training_encode_batch_size         = %d", self.training_encode_batch_size)
         log.info("  bc_pool_inference_steps            = %d", self.bc_pool_inference_steps)
+        log.info("  max_online_episodes loaded         = %s",
+                 self.max_online_episodes if self.max_online_episodes is not None else "all")
         log.info("  starting at total_episodes=%d, total_gradient_steps=%d",
                  self.total_episodes, self.total_gradient_steps)
-        self._write_status("idle", "polling for episodes")
-
         while True:
+            self._write_status("scanning", "checking disk episodes")
             new_count = self._scan_new_disk_episodes()
             if new_count > 0 and self.total_gradient_steps > 0:
                 # Re-push current weights so env runner always has the latest actor.
@@ -410,10 +452,22 @@ class YAMRLLearner:
                         self._write_status("training", "running learner training round")
                         self._train_round()
                         self._push_actor_weights()
+                        rounds_this_run += 1
                     finally:
                         self._write_status("idle", "polling for episodes")
+                    if (max_training_rounds is not None and
+                            rounds_this_run >= max_training_rounds):
+                        log.info("Reached max_training_rounds=%d; exiting learner.",
+                                 max_training_rounds)
+                        return
                     continue  # immediately re-check (no sleep) after training
 
+            if exit_when_idle:
+                self._write_status("idle", "polling for episodes")
+                log.info("No training round due; exiting learner because exit_when_idle=True.")
+                return
+
+            self._write_status("idle", "polling for episodes")
             if new_count == 0:
                 time.sleep(2.0)
 
@@ -466,8 +520,8 @@ class YAMRLLearner:
             "message": str(message),
             "pid": os.getpid(),
             "time": time.time(),
-            "total_episodes": int(self.total_episodes),
-            "total_gradient_steps": int(self.total_gradient_steps),
+            "total_episodes": int(getattr(self, "total_episodes", 0)),
+            "total_gradient_steps": int(getattr(self, "total_gradient_steps", 0)),
         }
         tmp = self._status_path + ".tmp"
         try:
@@ -484,7 +538,113 @@ class YAMRLLearner:
         if n <= 0:
             log.info("Robometer: no pending episodes to shape before training")
             return
-        self.replay_buffer.shape_pending_robometer_rewards()
+        started = self._start_robometer_server_if_needed()
+        try:
+            self.replay_buffer.shape_pending_robometer_rewards()
+        finally:
+            if started and self.robometer_stop_server_after_reward:
+                self._stop_robometer_server()
+
+    def _robometer_server_is_local(self) -> bool:
+        host = (urlparse(self.robometer_server_url).hostname or "").lower()
+        return host in ("", "127.0.0.1", "localhost", "0.0.0.0")
+
+    def _robometer_server_healthy(self) -> bool:
+        try:
+            from dice_rl.reward.robometer_client import health_check
+            return health_check(self.robometer_server_url, timeout_s=5.0)
+        except Exception:
+            return False
+
+    def _start_robometer_server_if_needed(self) -> bool:
+        """Start local Robometer server lazily for reward shaping.
+
+        Returns True only when this learner launched the server. If a server is
+        already running, it is reused and left running.
+        """
+        if not self.robometer_auto_start_server:
+            return False
+        if self._robometer_server_healthy():
+            log.info("Robometer server already healthy at %s", self.robometer_server_url)
+            return False
+        if not self._robometer_server_is_local():
+            log.warning(
+                "Robometer server %s is not local; auto-start is skipped",
+                self.robometer_server_url)
+            return False
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        if self.robometer_server_launch_cmd:
+            cmd = self.robometer_server_launch_cmd
+            shell = True
+        else:
+            cmd = ["bash", os.path.join(repo_root, "scripts", "launch_isolated.sh"), "server"]
+            shell = False
+
+        os.makedirs(os.path.dirname(self.robometer_server_log_path), exist_ok=True)
+        self._robometer_server_log_fh = open(self.robometer_server_log_path, "ab", buffering=0)
+        log.info("Starting Robometer server on demand. Log: %s",
+                 self.robometer_server_log_path)
+        self._robometer_server_proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            shell=shell,
+            stdout=self._robometer_server_log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+
+        deadline = time.monotonic() + self.robometer_server_start_timeout_s
+        while time.monotonic() < deadline:
+            if self._robometer_server_healthy():
+                log.info("Robometer server is healthy at %s", self.robometer_server_url)
+                return True
+            rc = self._robometer_server_proc.poll()
+            if rc is not None:
+                self._close_robometer_server_log()
+                raise RuntimeError(
+                    f"Robometer server exited during startup with code {rc}. "
+                    f"See {self.robometer_server_log_path}"
+                )
+            time.sleep(2.0)
+
+        self._stop_robometer_server()
+        raise RuntimeError(
+            f"Timed out waiting for Robometer server at {self.robometer_server_url}. "
+            f"See {self.robometer_server_log_path}"
+        )
+
+    def _stop_robometer_server(self) -> None:
+        proc = self._robometer_server_proc
+        self._robometer_server_proc = None
+        if proc is None:
+            self._close_robometer_server_log()
+            return
+        log.info("Stopping on-demand Robometer server pid=%s", proc.pid)
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            log.warning("Failed to SIGTERM Robometer server pid=%s: %s", proc.pid, e)
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5.0)
+        self._close_robometer_server_log()
+
+    def _close_robometer_server_log(self) -> None:
+        if self._robometer_server_log_fh is not None:
+            try:
+                self._robometer_server_log_fh.close()
+            except Exception:
+                pass
+            self._robometer_server_log_fh = None
 
     def _log_success_rate(self) -> None:
         n   = len(self._recent_outcomes)

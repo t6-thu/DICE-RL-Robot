@@ -12,6 +12,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import copy
+import argparse
 
 from dice_rl.config import yam_rl_config as cfg
 from dice_rl.config.yam_env_overrides import (
@@ -24,6 +25,14 @@ from dice_rl.config.yam_rl_config import (
     TRAINING, NETWORK, COMM,
 )
 from dice_rl.learner.yam_rl_learner import YAMRLLearner
+
+_p = argparse.ArgumentParser()
+_p.add_argument("--max-training-rounds", type=int, default=None,
+                help="Exit after this many training rounds. Useful for staged "
+                     "collect-then-train workflows.")
+_p.add_argument("--exit-when-idle", action="store_true",
+                help="Exit instead of polling forever when no training round is due.")
+_args, _ = _p.parse_known_args()
 
 # Robometer / reward toggles via env (see scripts/robometer/README.md).
 _training = apply_learner_env_overrides(
@@ -58,4 +67,7 @@ learner = YAMRLLearner(
     hire_expert_curation_path = HIRE_EXPERT_CURATION_PATH,
     **{**_training, **NETWORK, **COMM},
 )
-learner.run()
+learner.run(
+    max_training_rounds=_args.max_training_rounds,
+    exit_when_idle=_args.exit_when_idle,
+)

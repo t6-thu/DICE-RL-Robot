@@ -66,6 +66,7 @@ class YAMReplayBuffer:
         action_dim: int = 7,
         action_horizon: int = 16,
         max_online_size: int = 50_000,
+        max_online_episodes: Optional[int] = None,
         device: str = "cuda",
         hire_shaper=None,
         robometer_shaper=None,
@@ -134,6 +135,12 @@ class YAMReplayBuffer:
         self.online_data_dir = online_data_dir
         os.makedirs(online_data_dir, exist_ok=True)
         self._max_online = max_online_size
+        self._max_online_episodes = (
+            int(max_online_episodes)
+            if max_online_episodes is not None and int(max_online_episodes) > 0
+            else None
+        )
+        self._total_disk_episodes = 0
         self._online: deque = deque(maxlen=max_online_size)
         self._num_online_episodes = 0
         self._load_existing_episodes()
@@ -145,15 +152,29 @@ class YAMReplayBuffer:
     def _load_existing_episodes(self) -> None:
         self.loaded_paths: list = []
         paths = sorted(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
+        self._total_disk_episodes = len(paths)
         if not paths:
             return
-        log.info("Loading %d saved episodes from disk (please wait)…", len(paths))
-        for i, p in enumerate(paths):
+        if self._max_online_episodes is not None and len(paths) > self._max_online_episodes:
+            skipped = paths[:-self._max_online_episodes]
+            paths_to_load = paths[-self._max_online_episodes:]
+            # Mark older files as seen so the learner does not immediately
+            # reload them through the disk polling path. They are represented
+            # by the resumed checkpoint; the in-memory buffer only needs the
+            # recent online data used for the next staged training round.
+            self.loaded_paths.extend(skipped)
+            log.info(
+                "Loading last %d/%d saved episodes from disk (skipping older %d to cap memory)…",
+                len(paths_to_load), len(paths), len(skipped))
+        else:
+            paths_to_load = paths
+            log.info("Loading %d saved episodes from disk (please wait)…", len(paths_to_load))
+        for i, p in enumerate(paths_to_load):
             d = np.load(p)
             self.add_episode({k: d[k] for k in d.files})
             self.loaded_paths.append(p)
-            if (i + 1) % 5 == 0 or (i + 1) == len(paths):
-                log.info("  … %d/%d episodes loaded", i + 1, len(paths))
+            if (i + 1) % 5 == 0 or (i + 1) == len(paths_to_load):
+                log.info("  … %d/%d episodes loaded", i + 1, len(paths_to_load))
         log.info("Online buffer restored: %d transitions from %d episodes",
                  len(self._online), self._num_online_episodes)
 
@@ -233,7 +254,10 @@ class YAMReplayBuffer:
             self._robometer_pending.append({
                 "start": start_idx,
                 "end": end_idx,
-                "images": np.asarray(I).copy(),
+                # Keep a reference to the episode images for deferred scoring.
+                # Copying here doubles online image memory during learner
+                # startup and can push a 64GB workstation into OOM.
+                "images": np.asarray(I),
                 "horizon": H,
             })
 
@@ -375,6 +399,10 @@ class YAMReplayBuffer:
     @property
     def num_expert_transitions(self) -> int:
         return len(self._expert_indices)
+
+    @property
+    def total_disk_episodes(self) -> int:
+        return int(self._total_disk_episodes)
 
 
 # ---- helpers ----

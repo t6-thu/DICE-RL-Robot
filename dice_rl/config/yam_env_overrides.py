@@ -53,6 +53,9 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
         "robometer_query_every_n_chunks": ("YAM_ROBOMETER_QUERY_EVERY_N_CHUNKS",),
         "robometer_max_frames": ("YAM_ROBOMETER_MAX_FRAMES",),
         "robometer_request_timeout_s": ("YAM_ROBOMETER_REQUEST_TIMEOUT_S",),
+        "robometer_server_launch_cmd": ("YAM_ROBOMETER_SERVER_LAUNCH_CMD",),
+        "robometer_server_log_path": ("YAM_ROBOMETER_SERVER_LOG_PATH",),
+        "robometer_server_start_timeout_s": ("YAM_ROBOMETER_SERVER_START_TIMEOUT_S",),
     }
     for key, env_names in mapping.items():
         for en in env_names:
@@ -62,6 +65,7 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
                     "robometer_reward_weight",
                     "robometer_gamma_pbrs",
                     "robometer_request_timeout_s",
+                    "robometer_server_start_timeout_s",
                 ):
                     out[key] = float(val)
                 elif key in (
@@ -90,6 +94,14 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
         out["robometer_defer_reward_until_training"] = bool(
             out.get("robometer_defer_reward_until_training", True)
         )
+    if os.environ.get("YAM_ROBOMETER_AUTO_START_SERVER") not in (None, ""):
+        out["robometer_auto_start_server"] = _bool(
+            "YAM_ROBOMETER_AUTO_START_SERVER", True
+        )
+    if os.environ.get("YAM_ROBOMETER_STOP_SERVER_AFTER_REWARD") not in (None, ""):
+        out["robometer_stop_server_after_reward"] = _bool(
+            "YAM_ROBOMETER_STOP_SERVER_AFTER_REWARD", True
+        )
 
     return out
 
@@ -103,6 +115,8 @@ def apply_learner_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
     """
     out = dict(training)
     mapping = {
+        "num_episodes_before_first_training": ("YAM_LEARNER_NUM_EPISODES_BEFORE_FIRST_TRAINING",),
+        "update_every_x_episode": ("YAM_LEARNER_UPDATE_EVERY_X_EPISODE",),
         "gradient_steps": ("YAM_LEARNER_GRADIENT_STEPS",),
         "batch_size": ("YAM_LEARNER_BATCH_SIZE",),
         "num_next_noise_samples": ("YAM_LEARNER_K_CRITIC",),
@@ -110,6 +124,7 @@ def apply_learner_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
         "training_pool_size_limit": ("YAM_LEARNER_POOL_SIZE_LIMIT",),
         "training_encode_batch_size": ("YAM_LEARNER_ENCODE_BATCH_SIZE",),
         "bc_pool_inference_steps": ("YAM_LEARNER_BC_POOL_INFERENCE_STEPS",),
+        "max_online_episodes": ("YAM_LEARNER_MAX_ONLINE_EPISODES",),
     }
     for key, env_names in mapping.items():
         for en in env_names:
