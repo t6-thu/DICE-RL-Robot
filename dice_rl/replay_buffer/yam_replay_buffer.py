@@ -69,6 +69,7 @@ class YAMReplayBuffer:
         device: str = "cuda",
         hire_shaper=None,
         robometer_shaper=None,
+        defer_robometer_reward: bool = True,
         use_sparse_for_online_success: bool = False,
         expert_curation_path: Optional[str] = None,
     ) -> None:
@@ -79,6 +80,8 @@ class YAMReplayBuffer:
         # Optional dense reward shapers (HiRE or Robometer; mutually exclusive).
         self.hire_shaper = hire_shaper
         self.robometer_shaper = robometer_shaper
+        self.defer_robometer_reward = bool(defer_robometer_reward)
+        self._robometer_pending: list = []
         if hire_shaper is not None and robometer_shaper is not None:
             raise ValueError("hire_shaper and robometer_shaper are mutually exclusive")
         # Switch: when True, batches sampled from online SUCCESS episodes use the
@@ -192,7 +195,16 @@ class YAMReplayBuffer:
         # HiRE PBRS shaping with H-step lookahead:
         #   r̃_t = R_sparse[t+H] + γ·Φ(s_{t+H}) − Φ(s_t)
         # Terminal boundary: Φ(s_{T-1}) = 0 (last frame of episode).
-        if self.robometer_shaper is not None and self.robometer_shaper.is_ready():
+        defer_robometer = (
+            self.robometer_shaper is not None
+            and self.robometer_shaper.is_ready()
+            and self.defer_robometer_reward
+        )
+        if (
+            self.robometer_shaper is not None
+            and self.robometer_shaper.is_ready()
+            and not defer_robometer
+        ):
             # Robometer-only dense reward (no sparse terminal term), like HiRE-Dice
             # robometer RLPD online rollouts.
             R_shaped_tr = self.robometer_shaper.shape_rewards(I, horizon=H)
@@ -204,6 +216,7 @@ class YAMReplayBuffer:
                 [float(R_sparse[t + H]) for t in range(T - H)], dtype=np.float32
             )
 
+        start_idx = len(self._online)
         for t in range(T - H):
             obs      = self._make_obs(I, S, t,     ep_start)
             next_obs = self._make_obs(I, S, t + H, ep_start)
@@ -214,10 +227,64 @@ class YAMReplayBuffer:
             self._online.append((obs, chunk,
                                  float(R_shaped_tr[t]), r_sparse,
                                  success, next_obs, done))
+        end_idx = len(self._online)
+
+        if defer_robometer and end_idx > start_idx:
+            self._robometer_pending.append({
+                "start": start_idx,
+                "end": end_idx,
+                "images": np.asarray(I).copy(),
+                "horizon": H,
+            })
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
                   len(self._online), self._num_online_episodes)
+
+    @property
+    def num_pending_robometer_episodes(self) -> int:
+        return len(self._robometer_pending)
+
+    def shape_pending_robometer_rewards(self) -> int:
+        """Run deferred Robometer scoring and patch online transition rewards.
+
+        Episode insertion stays lightweight during robot rollout. This method is
+        called by the learner immediately before a training round, when it is
+        acceptable for the workstation to run the Robometer server.
+        """
+        if self.robometer_shaper is None or not self.robometer_shaper.is_ready():
+            return 0
+        pending = self._robometer_pending
+        if not pending:
+            return 0
+
+        online_list = list(self._online)
+        shaped = 0
+        log.info("Robometer: shaping %d pending online episodes before training", len(pending))
+        for item in pending:
+            start = int(item["start"])
+            end = int(item["end"])
+            if start < 0 or end > len(online_list) or end <= start:
+                log.warning(
+                    "Robometer: skipped stale pending range start=%d end=%d len=%d",
+                    start, end, len(online_list))
+                continue
+            rewards = self.robometer_shaper.shape_rewards(
+                item["images"],
+                horizon=int(item["horizon"]),
+            )
+            n = min(end - start, len(rewards))
+            for offset in range(n):
+                idx = start + offset
+                o, a, _r_old, r_sparse, is_success, no, done = online_list[idx]
+                online_list[idx] = (
+                    o, a, float(rewards[offset]), r_sparse, is_success, no, done
+                )
+            shaped += 1
+        self._online = deque(online_list, maxlen=self._max_online)
+        self._robometer_pending = []
+        log.info("Robometer: shaped %d/%d pending online episodes", shaped, len(pending))
+        return shaped
 
     def _make_obs(self, images, states, t, ep_start):
         """Build the obs history dict at time t (padded at episode start)."""

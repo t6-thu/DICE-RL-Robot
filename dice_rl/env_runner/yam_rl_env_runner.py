@@ -18,6 +18,7 @@ Algorithm (one episode)
 
 from __future__ import annotations
 import glob
+import json
 import logging
 import os
 import pickle
@@ -177,6 +178,10 @@ class YAMRLEnvRunner:
         self._last_delta_rms = 0.0
         self.online_data_dir = online_data_dir
         self.rl_checkpoint_dir = rl_checkpoint_dir
+        self._learner_status_path = (
+            os.path.join(rl_checkpoint_dir, "learner_status.json")
+            if rl_checkpoint_dir else None
+        )
         self._latest_weights_path = (
             os.path.join(rl_checkpoint_dir, "latest_actor.pt") if rl_checkpoint_dir else None
         )
@@ -447,6 +452,9 @@ class YAMRLEnvRunner:
             log.info("Resuming: %d episodes already saved in %s", ep, self.online_data_dir)
 
         while True:
+            # Do not start a robot rollout while the learner is running the
+            # heavy Robometer-reward or training phase on this workstation.
+            self._wait_for_learner_idle()
             # Check for updated actor weights from learner.
             self._try_update_actor()
             actor_info = (f"RL actor step={self._actor_step}"
@@ -457,6 +465,12 @@ class YAMRLEnvRunner:
                 log.info("Episode discarded.")
                 self._move_to_home()
                 continue
+
+            # Publish the episode only after the robot is safely back at home.
+            # The learner may start Robometer scoring/training as soon as the
+            # npz appears on disk, so do not expose the file while the robot is
+            # still moving.
+            self._move_to_home()
 
             # Save episode to disk (survives learner/runner crashes).
             # Images stored as uint8 [0,255] for compact storage (~4× smaller
@@ -476,8 +490,48 @@ class YAMRLEnvRunner:
             log.info("Episode %d saved+sent (success=%s)", ep+1, ep_data["success"])
             ep += 1
 
-            # Auto-home at end of every episode (ready for the next one).
-            self._move_to_home()
+    def _wait_for_learner_idle(self) -> None:
+        if not self._learner_status_path:
+            return
+        last_log = 0.0
+        while True:
+            try:
+                with open(self._learner_status_path) as f:
+                    status = json.load(f)
+            except FileNotFoundError:
+                return
+            except Exception as e:
+                log.warning("Could not read learner status %s: %s",
+                            self._learner_status_path, e)
+                return
+
+            phase = str(status.get("phase", "idle"))
+            if phase == "idle":
+                return
+
+            pid = status.get("pid")
+            alive = False
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                except PermissionError:
+                    alive = True
+            if not alive:
+                log.warning(
+                    "Ignoring stale learner status phase=%s pid=%s (process not alive)",
+                    phase, pid)
+                return
+
+            now = time.monotonic()
+            if now - last_log > 15.0:
+                log.info(
+                    "Learner is %s (%s); waiting before starting next robot episode",
+                    phase, status.get("message", ""))
+                last_log = now
+            time.sleep(2.0)
 
     def _try_update_actor(self) -> None:
         """Pick up the latest actor weights from disk if they're newer than what we have."""

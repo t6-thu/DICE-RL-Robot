@@ -28,6 +28,7 @@ Key hyperparams (from rl_finetuning_config.py)
 
 from __future__ import annotations
 import glob
+import json
 import logging
 import os
 import pickle
@@ -111,6 +112,7 @@ class YAMRLLearner:
         robometer_query_every_n_chunks: int = 1,
         robometer_query_fill_mode: str = "hold",
         robometer_max_batch_size: int = 4,
+        robometer_defer_reward_until_training: bool = True,
         hire_init_dir: str = None,                # past online episodes to seed pos/neg
         hire_expert_curation_path: str = None,    # JSON listing which expert eps to include
         hire_reward_weight: float = 1.0,
@@ -168,6 +170,10 @@ class YAMRLLearner:
         self.ratio_end = adaptive_expert_ratio_end
         self.ratio_steps = adaptive_expert_ratio_steps
         self.rl_checkpoint_dir = rl_checkpoint_dir
+        self._status_path = (
+            os.path.join(rl_checkpoint_dir, "learner_status.json")
+            if rl_checkpoint_dir else None
+        )
         if rl_checkpoint_dir:
             os.makedirs(rl_checkpoint_dir, exist_ok=True)
 
@@ -225,6 +231,9 @@ class YAMRLLearner:
         # ---- Reward shaper (HiRE or Robometer; not both) ----
         self.use_hire_reward = use_hire_reward
         self.use_robometer_reward = use_robometer_reward
+        self.robometer_defer_reward_until_training = bool(
+            robometer_defer_reward_until_training
+        )
         self.use_sparse_for_online_success = use_sparse_for_online_success
         self.hire_shaper = None
         self.robometer_shaper = None
@@ -241,8 +250,10 @@ class YAMRLLearner:
                     "robometer_task_instruction is required when use_robometer_reward=True"
                 )
             log.info(
-                "Robometer enabled — online rewards from server %s (expert stays sparse)",
+                "Robometer enabled — online rewards from server %s "
+                "(expert stays sparse, defer_until_training=%s)",
                 robometer_server_url,
+                self.robometer_defer_reward_until_training,
             )
             self.robometer_shaper = RobometerEpisodeRewardShaper(
                 server_url=robometer_server_url,
@@ -313,6 +324,7 @@ class YAMRLLearner:
             device=device,
             hire_shaper=self.hire_shaper,
             robometer_shaper=self.robometer_shaper,
+            defer_robometer_reward=self.robometer_defer_reward_until_training,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
             expert_curation_path=hire_expert_curation_path,  # use 24 curated episodes for RL training
                                                               # (same JSON as HiRE positive buffer above)
@@ -371,6 +383,7 @@ class YAMRLLearner:
         log.info("  bc_pool_inference_steps            = %d", self.bc_pool_inference_steps)
         log.info("  starting at total_episodes=%d, total_gradient_steps=%d",
                  self.total_episodes, self.total_gradient_steps)
+        self._write_status("idle", "polling for episodes")
 
         while True:
             new_count = self._scan_new_disk_episodes()
@@ -391,8 +404,14 @@ class YAMRLLearner:
                     self._log_success_rate()
                     log.info("Training round (episode %d): expected=%d done=%d → training…",
                              self.total_episodes, expected_rounds, done_rounds)
-                    self._train_round()
-                    self._push_actor_weights()
+                    try:
+                        self._write_status("rewarding", "shaping pending Robometer rewards")
+                        self._shape_pending_rewards_before_training()
+                        self._write_status("training", "running learner training round")
+                        self._train_round()
+                        self._push_actor_weights()
+                    finally:
+                        self._write_status("idle", "polling for episodes")
                     continue  # immediately re-check (no sleep) after training
 
             if new_count == 0:
@@ -438,6 +457,34 @@ class YAMRLLearner:
             self._loaded_disk_files.add(p)
             loaded_count += 1
         return loaded_count
+
+    def _write_status(self, phase: str, message: str = "") -> None:
+        if not self._status_path:
+            return
+        payload = {
+            "phase": str(phase),
+            "message": str(message),
+            "pid": os.getpid(),
+            "time": time.time(),
+            "total_episodes": int(self.total_episodes),
+            "total_gradient_steps": int(self.total_gradient_steps),
+        }
+        tmp = self._status_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._status_path)
+        except Exception as e:
+            log.warning("Failed to write learner status %s: %s", self._status_path, e)
+
+    def _shape_pending_rewards_before_training(self) -> None:
+        if self.robometer_shaper is None:
+            return
+        n = getattr(self.replay_buffer, "num_pending_robometer_episodes", 0)
+        if n <= 0:
+            log.info("Robometer: no pending episodes to shape before training")
+            return
+        self.replay_buffer.shape_pending_robometer_rewards()
 
     def _log_success_rate(self) -> None:
         n   = len(self._recent_outcomes)

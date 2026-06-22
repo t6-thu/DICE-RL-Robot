@@ -82,6 +82,14 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
         out["robometer_use_relative_rewards"] = _bool(
             "YAM_ROBOMETER_USE_RELATIVE_REWARDS", True
         )
+    if os.environ.get("YAM_ROBOMETER_DEFER_REWARD_UNTIL_TRAINING") not in (None, ""):
+        out["robometer_defer_reward_until_training"] = _bool(
+            "YAM_ROBOMETER_DEFER_REWARD_UNTIL_TRAINING", True
+        )
+    elif out.get("use_robometer_reward", False):
+        out["robometer_defer_reward_until_training"] = bool(
+            out.get("robometer_defer_reward_until_training", True)
+        )
 
     return out
 

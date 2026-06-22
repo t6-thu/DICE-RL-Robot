@@ -225,6 +225,9 @@ TRAINING = dict(
     robometer_query_every_n_chunks = 4,
     robometer_query_fill_mode      = "hold",
     robometer_max_batch_size       = 4,
+    # Keep robot rollout responsive: disk episode loading is cheap, but
+    # Robometer HTTP scoring is deferred until the learner is about to train.
+    robometer_defer_reward_until_training = True,
 
     hire_reward_weight             = 1.0,    # scales Φ
     hire_contrastive_lambda        = 0.1,    # 0 = disable negative term, Φ(s) = reward_weight · sim_pos only
