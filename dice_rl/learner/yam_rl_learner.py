@@ -45,7 +45,10 @@ import torch.nn.functional as F
 
 from dice_rl.communication.learner_node import Learner
 from dice_rl.model.distill_rl import DistilledActor, DistilledCritic
-from dice_rl.replay_buffer.yam_replay_buffer import YAMReplayBuffer
+from dice_rl.replay_buffer.yam_replay_buffer import (
+    YAMReplayBuffer,
+    list_episode_npz_paths,
+)
 from utils.model_io import load_policy
 
 log = logging.getLogger(__name__)
@@ -477,7 +480,7 @@ class YAMRLLearner:
         Returns the number of episodes ACTUALLY loaded (not just discovered).
         Files that look in-progress (mtime <2 s) are silently retried next pass.
         """
-        paths = sorted(glob.glob(os.path.join(self._online_data_dir, "episode_*.npz")))
+        paths = list_episode_npz_paths(self._online_data_dir)
         new_paths = [p for p in paths if p not in self._loaded_disk_files]
         if not new_paths:
             return 0
@@ -489,6 +492,7 @@ class YAMRLLearner:
                     continue  # not added to _loaded_disk_files → retry next pass
                 d = np.load(p)
                 ep_data = {k: d[k] for k in d.files}
+                ep_data["__path__"] = p
             except Exception as e:
                 log.warning("Episode %s not yet readable (%s); will retry", p, e)
                 continue

@@ -28,10 +28,20 @@ Interactive controls:
 import argparse
 import glob
 import os
+import re
 import sys
 
 import cv2
 import numpy as np
+
+_EPISODE_FILE_RE = re.compile(r"^episode_\d+\.npz$")
+
+
+def _list_episode_npz_paths(directory: str) -> list[str]:
+    return sorted(
+        p for p in glob.glob(os.path.join(directory, "episode_*.npz"))
+        if _EPISODE_FILE_RE.match(os.path.basename(p))
+    )
 
 DEFAULT_DIR = os.path.expanduser("~/data/real_processed/yam_rl_rollouts_robometer_2000_1000")
 
@@ -188,7 +198,7 @@ def main() -> None:
     args = p.parse_args()
 
     if os.path.isdir(args.path):
-        files = sorted(glob.glob(os.path.join(args.path, "episode_*.npz")))
+        files = _list_episode_npz_paths(args.path)
         if not files:
             print(f"No episode_*.npz found under {args.path}")
             sys.exit(1)

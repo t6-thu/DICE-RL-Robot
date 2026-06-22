@@ -11,6 +11,7 @@ Aligned with HiRE-Dice_RL ``util/robometer_reward_shaper.py`` / LIBERO wrapper:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -119,6 +120,26 @@ class RobometerEpisodeRewardShaper:
 
     def is_ready(self) -> bool:
         return self.reward_weight > 0.0
+
+    def cache_key(self, horizon: int) -> str:
+        """Stable key for invalidating per-episode reward cache files."""
+        payload = {
+            "version": 1,
+            "task_instruction": self.task_instruction,
+            "reward_weight": self.reward_weight,
+            "camera": self.camera,
+            "use_frame_steps": self.use_frame_steps,
+            "max_frames": self.max_frames,
+            "request_timeout_s": self.request_timeout_s,
+            "bgr_to_rgb": self.bgr_to_rgb,
+            "use_relative_rewards": self.use_relative_rewards,
+            "gamma_pbrs": self.gamma_pbrs,
+            "query_every_n_chunks": self.query_every_n_chunks,
+            "query_fill_mode": self.query_fill_mode,
+            "max_batch_size": self.max_batch_size,
+            "horizon": int(horizon),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     def _extract_hwc_frames(self, images_T6HW: np.ndarray) -> np.ndarray:
         """(T, 6, H, W) → (T, H, W, 3) uint8 for the selected camera."""

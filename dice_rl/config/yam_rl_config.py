@@ -161,10 +161,10 @@ TRAINING = dict(
     training_pool_size_limit   = 10_000,
     training_encode_batch_size = 128,
     bc_pool_inference_steps    = 8,
-    # Keep only recent online episodes expanded in RAM. Older rollouts are
-    # represented by the resumed checkpoint; expanding every saved image window
-    # from 50+ rollouts can OOM a 64GB workstation.
-    max_online_episodes        = 12,
+    # Optional emergency cap. Default None keeps HiRE-style sampling over all
+    # saved online episodes; the replay buffer stores images once per episode
+    # so this no longer expands every transition into duplicated image windows.
+    max_online_episodes        = None,
 
     # --- RLPD expert ratio (anneals from 70% to 20%) ---
     use_adaptive_expert_ratio   = True,

@@ -16,10 +16,13 @@
 #
 # Plus thread caps so torch/openmp don't each spawn 24 threads.
 #
-# Usage (three separate terminals):
-#   bash scripts/launch_isolated.sh server      # robometer eval server
-#   bash scripts/launch_isolated.sh learner     # DICE-RL learner
+# Usage:
+#   bash scripts/launch_isolated.sh learner     # DICE-RL learner; starts Robometer on demand
 #   bash scripts/launch_isolated.sh envrunner   # robot env runner
+#
+# Manual server startup is still available for debugging, but the normal
+# Robometer path should let the learner start/stop it only while scoring.
+#   bash scripts/launch_isolated.sh server
 #
 # If the robometer server is ALREADY running, you don't need to restart it —
 # just rebind it live (this script's `rebind <PID>` does that):
@@ -54,13 +57,6 @@ case "$ROLE" in
     source ./prepare.sh
     export YAM_ROBOMETER_AUTO_START_SERVER="${YAM_ROBOMETER_AUTO_START_SERVER:-1}"
     export YAM_ROBOMETER_STOP_SERVER_AFTER_REWARD="${YAM_ROBOMETER_STOP_SERVER_AFTER_REWARD:-1}"
-    export YAM_LEARNER_MAX_ONLINE_EPISODES="${YAM_LEARNER_MAX_ONLINE_EPISODES:-12}"
-    export YAM_LEARNER_POOL_SIZE_LIMIT="${YAM_LEARNER_POOL_SIZE_LIMIT:-3000}"
-    export YAM_LEARNER_BATCH_SIZE="${YAM_LEARNER_BATCH_SIZE:-128}"
-    export YAM_LEARNER_K_ACTOR="${YAM_LEARNER_K_ACTOR:-2}"
-    export YAM_LEARNER_K_CRITIC="${YAM_LEARNER_K_CRITIC:-1}"
-    export YAM_LEARNER_ENCODE_BATCH_SIZE="${YAM_LEARNER_ENCODE_BATCH_SIZE:-32}"
-    export YAM_LEARNER_BC_POOL_INFERENCE_STEPS="${YAM_LEARNER_BC_POOL_INFERENCE_STEPS:-4}"
     LEARNER_LOG_DIR="$HOME/training_outputs/yam_rl_finetuning_$(python3 -c 'from dice_rl.config.yam_rl_config import RUN_NAME;print(RUN_NAME)')"
     mkdir -p "$LEARNER_LOG_DIR"
     exec env OMP_NUM_THREADS="$LEARNER_THREADS" MKL_NUM_THREADS="$LEARNER_THREADS" OPENBLAS_NUM_THREADS="$LEARNER_THREADS" \

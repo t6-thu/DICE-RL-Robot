@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import signal
 import sys
 import time
@@ -37,6 +38,15 @@ from dice_rl.model.distill_rl import DistilledActor
 from utils.model_io import load_policy
 
 log = logging.getLogger(__name__)
+
+_EPISODE_FILE_RE = re.compile(r"^episode_\d+\.npz$")
+
+
+def _list_episode_npz_paths(directory: str) -> list:
+    return sorted(
+        p for p in glob.glob(os.path.join(directory, "episode_*.npz"))
+        if _EPISODE_FILE_RE.match(os.path.basename(p))
+    )
 
 # ---- image helpers (same as eval_dp_yam.py) ----
 
@@ -454,7 +464,7 @@ class YAMRLEnvRunner:
         self._move_to_home()
 
         # Count already-saved episodes so numbering stays consistent across restarts.
-        ep = len(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
+        ep = len(_list_episode_npz_paths(self.online_data_dir))
         if ep > 0:
             log.info("Resuming: %d episodes already saved in %s", ep, self.online_data_dir)
         collected_this_run = 0

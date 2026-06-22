@@ -23,6 +23,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import re
 from collections import deque
 from typing import Dict, Optional
 
@@ -30,6 +31,16 @@ import numpy as np
 import torch
 
 log = logging.getLogger(__name__)
+
+_EPISODE_FILE_RE = re.compile(r"^episode_\d+\.npz$")
+
+
+def list_episode_npz_paths(directory: str) -> list:
+    """Return saved rollout episode files, excluding sidecar cache files."""
+    return sorted(
+        p for p in glob.glob(os.path.join(directory, "episode_*.npz"))
+        if _EPISODE_FILE_RE.match(os.path.basename(p))
+    )
 
 
 class YAMReplayBuffer:
@@ -141,7 +152,13 @@ class YAMReplayBuffer:
             else None
         )
         self._total_disk_episodes = 0
-        self._online: deque = deque(maxlen=max_online_size)
+        # Online data is stored episode-wise, not transition-wise. The old
+        # implementation expanded every transition into copied obs/next_obs
+        # image windows at startup; 50 saved rollouts could inflate into tens
+        # of GB. Keeping each episode image tensor once preserves the sampling
+        # distribution while making learner restarts cheap.
+        self._online_episodes: list = []
+        self._online_indices: deque = deque(maxlen=max_online_size)
         self._num_online_episodes = 0
         self._load_existing_episodes()
 
@@ -151,7 +168,7 @@ class YAMReplayBuffer:
 
     def _load_existing_episodes(self) -> None:
         self.loaded_paths: list = []
-        paths = sorted(glob.glob(os.path.join(self.online_data_dir, "episode_*.npz")))
+        paths = list_episode_npz_paths(self.online_data_dir)
         self._total_disk_episodes = len(paths)
         if not paths:
             return
@@ -171,12 +188,14 @@ class YAMReplayBuffer:
             log.info("Loading %d saved episodes from disk (please wait)…", len(paths_to_load))
         for i, p in enumerate(paths_to_load):
             d = np.load(p)
-            self.add_episode({k: d[k] for k in d.files})
+            ep = {k: d[k] for k in d.files}
+            ep["__path__"] = p
+            self.add_episode(ep)
             self.loaded_paths.append(p)
             if (i + 1) % 5 == 0 or (i + 1) == len(paths_to_load):
                 log.info("  … %d/%d episodes loaded", i + 1, len(paths_to_load))
         log.info("Online buffer restored: %d transitions from %d episodes",
-                 len(self._online), self._num_online_episodes)
+                 len(self._online_indices), self._num_online_episodes)
 
     def add_episode(self, episode: dict) -> None:
         """Add one online rollout episode to the buffer.
@@ -197,14 +216,14 @@ class YAMReplayBuffer:
             reward   = R_sparse[t + action_horizon]               ← reward on arrival
             done     = D[t + action_horizon]
         """
-        S = episode["states"]
-        A = episode["actions"]
+        S = np.asarray(episode["states"], dtype=np.float32)
+        A = np.asarray(episode["actions"], dtype=np.float32)
         R_sparse = np.asarray(episode["rewards"], dtype=np.float32)
-        D = episode["dones"]
-        I = episode["images"]
+        D = np.asarray(episode["dones"], dtype=bool)
+        I = np.asarray(episode["images"])
+        ep_path = episode.get("__path__")
         T = len(S)
         H = self.action_horizon
-        ep_start = 0
 
         if T <= H:
             log.debug("Episode too short (%d frames) for even one chunk, skipping", T)
@@ -221,7 +240,13 @@ class YAMReplayBuffer:
             and self.robometer_shaper.is_ready()
             and self.defer_robometer_reward
         )
-        if (
+        cached = None
+        if defer_robometer:
+            cached = self._load_cached_robometer_rewards(ep_path, H)
+
+        if cached is not None:
+            R_shaped_tr = cached
+        elif (
             self.robometer_shaper is not None
             and self.robometer_shaper.is_ready()
             and not defer_robometer
@@ -237,37 +262,105 @@ class YAMReplayBuffer:
                 [float(R_sparse[t + H]) for t in range(T - H)], dtype=np.float32
             )
 
-        start_idx = len(self._online)
-        for t in range(T - H):
-            obs      = self._make_obs(I, S, t,     ep_start)
-            next_obs = self._make_obs(I, S, t + H, ep_start)
-            chunk    = A[t : t + H]                    # (H, 7) real consecutive actions
-            r_sparse = float(R_sparse[t + H])
-            done     = bool(D[t + H])
-            # Tuple format: (obs, action, r_shaped, r_sparse, is_success, next_obs, done)
-            self._online.append((obs, chunk,
-                                 float(R_shaped_tr[t]), r_sparse,
-                                 success, next_obs, done))
-        end_idx = len(self._online)
+        if len(R_shaped_tr) != T - H:
+            raise ValueError(
+                f"episode reward length mismatch: got {len(R_shaped_tr)} "
+                f"expected {T - H}"
+            )
 
-        if defer_robometer and end_idx > start_idx:
+        ep_idx = len(self._online_episodes)
+        self._online_episodes.append({
+            "images": I,
+            "states": S,
+            "actions": A,
+            "rewards_sparse": R_sparse,
+            "rewards_shaped": np.asarray(R_shaped_tr, dtype=np.float32),
+            "dones": D,
+            "success": success,
+            "path": ep_path,
+            "horizon": H,
+        })
+        for t in range(T - H):
+            self._online_indices.append((ep_idx, t))
+
+        if defer_robometer and cached is None and ep_path:
             self._robometer_pending.append({
-                "start": start_idx,
-                "end": end_idx,
-                # Keep a reference to the episode images for deferred scoring.
-                # Copying here doubles online image memory during learner
-                # startup and can push a 64GB workstation into OOM.
-                "images": np.asarray(I),
+                "ep_idx": ep_idx,
+                "path": ep_path,
                 "horizon": H,
             })
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
-                  len(self._online), self._num_online_episodes)
+                  len(self._online_indices), self._num_online_episodes)
 
     @property
     def num_pending_robometer_episodes(self) -> int:
         return len(self._robometer_pending)
+
+    @staticmethod
+    def robometer_reward_cache_path(episode_path: Optional[str]) -> Optional[str]:
+        if not episode_path:
+            return None
+        root, ext = os.path.splitext(str(episode_path))
+        if ext != ".npz":
+            return str(episode_path) + ".robometer_rewards.npz"
+        return root + ".robometer_rewards.npz"
+
+    def _robometer_cache_key(self, horizon: int) -> str:
+        if self.robometer_shaper is None:
+            return ""
+        if hasattr(self.robometer_shaper, "cache_key"):
+            return self.robometer_shaper.cache_key(horizon)
+        return f"horizon={int(horizon)}"
+
+    def _load_cached_robometer_rewards(
+        self,
+        episode_path: Optional[str],
+        horizon: int,
+    ) -> Optional[np.ndarray]:
+        cache_path = self.robometer_reward_cache_path(episode_path)
+        if not cache_path or not os.path.exists(cache_path):
+            return None
+        try:
+            d = np.load(cache_path, allow_pickle=False)
+            rewards = np.asarray(d["rewards"], dtype=np.float32)
+            cached_horizon = int(np.asarray(d["horizon"]).item())
+            cache_key = str(np.asarray(d["cache_key"]).item())
+        except Exception as e:
+            log.warning("Robometer: ignoring unreadable cache %s (%s)", cache_path, e)
+            return None
+        if cached_horizon != int(horizon):
+            log.info(
+                "Robometer: ignoring cache %s due to horizon mismatch %d != %d",
+                cache_path, cached_horizon, int(horizon))
+            return None
+        expected_key = self._robometer_cache_key(horizon)
+        if cache_key != expected_key:
+            log.info("Robometer: ignoring stale cache %s (config changed)", cache_path)
+            return None
+        return rewards
+
+    def _save_cached_robometer_rewards(
+        self,
+        episode_path: Optional[str],
+        horizon: int,
+        rewards: np.ndarray,
+    ) -> None:
+        cache_path = self.robometer_reward_cache_path(episode_path)
+        if not cache_path:
+            return
+        tmp = cache_path + ".tmp"
+        rewards = np.asarray(rewards, dtype=np.float32)
+        np.savez_compressed(
+            tmp,
+            rewards=rewards,
+            horizon=np.array(int(horizon), dtype=np.int64),
+            cache_key=np.array(self._robometer_cache_key(horizon)),
+        )
+        # np.savez appends ".npz" if the filename does not already end with it.
+        actual_tmp = tmp if os.path.exists(tmp) else tmp + ".npz"
+        os.replace(actual_tmp, cache_path)
 
     def shape_pending_robometer_rewards(self) -> int:
         """Run deferred Robometer scoring and patch online transition rewards.
@@ -282,30 +375,29 @@ class YAMReplayBuffer:
         if not pending:
             return 0
 
-        online_list = list(self._online)
         shaped = 0
         log.info("Robometer: shaping %d pending online episodes before training", len(pending))
         for item in pending:
-            start = int(item["start"])
-            end = int(item["end"])
-            if start < 0 or end > len(online_list) or end <= start:
-                log.warning(
-                    "Robometer: skipped stale pending range start=%d end=%d len=%d",
-                    start, end, len(online_list))
+            ep_idx = int(item["ep_idx"])
+            horizon = int(item["horizon"])
+            if ep_idx < 0 or ep_idx >= len(self._online_episodes):
+                log.warning("Robometer: skipped stale pending ep_idx=%d", ep_idx)
                 continue
-            rewards = self.robometer_shaper.shape_rewards(
-                item["images"],
-                horizon=int(item["horizon"]),
-            )
-            n = min(end - start, len(rewards))
-            for offset in range(n):
-                idx = start + offset
-                o, a, _r_old, r_sparse, is_success, no, done = online_list[idx]
-                online_list[idx] = (
-                    o, a, float(rewards[offset]), r_sparse, is_success, no, done
+            ep = self._online_episodes[ep_idx]
+            rewards = self._load_cached_robometer_rewards(ep.get("path"), horizon)
+            if rewards is None:
+                rewards = self.robometer_shaper.shape_rewards(
+                    ep["images"],
+                    horizon=horizon,
                 )
+                self._save_cached_robometer_rewards(ep.get("path"), horizon, rewards)
+            if len(rewards) != len(ep["rewards_shaped"]):
+                log.warning(
+                    "Robometer: skipped %s due to reward length mismatch %d != %d",
+                    ep.get("path"), len(rewards), len(ep["rewards_shaped"]))
+                continue
+            ep["rewards_shaped"] = np.asarray(rewards, dtype=np.float32)
             shaped += 1
-        self._online = deque(online_list, maxlen=self._max_online)
         self._robometer_pending = []
         log.info("Robometer: shaped %d/%d pending online episodes", shaped, len(pending))
         return shaped
@@ -344,7 +436,7 @@ class YAMReplayBuffer:
         batches = []
         if n_expert > 0 and len(self._expert_indices) > 0:
             batches.append(self._sample_expert(n_expert, dev))
-        if n_online > 0 and len(self._online) > 0:
+        if n_online > 0 and len(self._online_indices) > 0:
             batches.append(self._sample_online(n_online, dev))
 
         if not batches:
@@ -373,11 +465,20 @@ class YAMReplayBuffer:
         return _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert=True)
 
     def _sample_online(self, n: int, dev: torch.device) -> dict:
-        online_list = list(self._online)
-        idxs = np.random.randint(0, len(online_list), n)
+        online_indices = list(self._online_indices)
+        idxs = np.random.randint(0, len(online_indices), n)
         obs_list, next_obs_list, acts, rews, dones = [], [], [], [], []
         for i in idxs:
-            o, a, r_shaped, r_sparse, is_success, no, d = online_list[i]
+            ep_idx, t = online_indices[i]
+            ep = self._online_episodes[int(ep_idx)]
+            H = int(ep["horizon"])
+            o = self._make_obs(ep["images"], ep["states"], int(t), 0)
+            no = self._make_obs(ep["images"], ep["states"], int(t) + H, 0)
+            a = ep["actions"][int(t) : int(t) + H]
+            r_shaped = float(ep["rewards_shaped"][int(t)])
+            r_sparse = float(ep["rewards_sparse"][int(t) + H])
+            is_success = bool(ep["success"])
+            d = bool(ep["dones"][int(t) + H])
             # Online-success switch (HiRE only): revert success transitions to sparse.
             # Robometer mode always uses shaped rewards for all online transitions.
             if (
@@ -394,7 +495,7 @@ class YAMReplayBuffer:
 
     @property
     def num_online_transitions(self) -> int:
-        return len(self._online)
+        return len(self._online_indices)
 
     @property
     def num_expert_transitions(self) -> int:
