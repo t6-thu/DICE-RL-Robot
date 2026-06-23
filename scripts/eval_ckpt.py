@@ -113,6 +113,9 @@ def main():
                    help="root dir for saved eval episodes")
     p.add_argument("--residual-scale", type=float, default=1.0,
                    help="scale on actor delta (matches env_runner default 1.0)")
+    p.add_argument("--max-joint-step", type=float, default=0.04,
+                   help="max absolute command change per 30 Hz step; keep this "
+                        "conservative for real-robot ckpt eval")
     args = p.parse_args()
 
     # Build the env runner with NO weights-watch path → it never auto-loads
@@ -134,6 +137,7 @@ def main():
         action_dim=TRAINING["action_dim"],
         actor_hidden_dims=NETWORK["actor_hidden_dims"],
         residual_scale=args.residual_scale,
+        max_joint_step=args.max_joint_step,
         online_data_dir="/tmp/_eval_dummy_unused",   # we override save dir ourselves
         rl_checkpoint_dir=None,                       # disables auto-update from latest_actor.pt
         network_server_endpoint=COMM["network_server_endpoint"],
