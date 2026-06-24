@@ -180,6 +180,24 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, "checkpoints"), **cfg.checkpoint.topk
         )
+        max_global_steps = cfg.training.get("max_global_steps", None)
+        checkpoint_every_steps = cfg.training.get("checkpoint_every_steps", None)
+
+        def save_step_checkpoint_if_due():
+            if checkpoint_every_steps is None:
+                return
+            if self.global_step <= 0 or self.global_step % int(checkpoint_every_steps) != 0:
+                return
+            if not accelerator.is_main_process:
+                return
+            model_ddp = self.model
+            self.model = accelerator.unwrap_model(self.model)
+            ckpt_dir = os.path.join(self.output_dir, "checkpoints")
+            ckpt_path = os.path.join(ckpt_dir, f"step_{self.global_step:06d}.ckpt")
+            self.save_checkpoint(path=ckpt_path, use_thread=False)
+            self.save_checkpoint(tag="latest", use_thread=False)
+            accelerator.print(f"Saved step checkpoint: {ckpt_path}")
+            self.model = model_ddp
 
         # device transfer
         # device = torch.device(cfg.training.device)
@@ -238,7 +256,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, "logs.json.txt")
         with JsonLogger(log_path) as json_logger:
+            stop_training = False
             for local_epoch_idx in range(cfg.training.num_epochs):
+                if max_global_steps is not None and self.global_step >= int(max_global_steps):
+                    break
                 self.model.train()
 
                 step_log = dict()
@@ -281,6 +302,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     mininterval=cfg.training.tqdm_interval_sec,
                 ) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
+                        if max_global_steps is not None and self.global_step >= int(max_global_steps):
+                            stop_training = True
+                            break
                         # device transfer
                         batch = dict_apply(
                             batch, lambda x: x.to(device, non_blocking=True)
@@ -383,11 +407,21 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             accelerator.log(step_log, step=self.global_step)
                             json_logger.log(step_log)
                             self.global_step += 1
+                            save_step_checkpoint_if_due()
+                            if (
+                                max_global_steps is not None
+                                and self.global_step >= int(max_global_steps)
+                            ):
+                                stop_training = True
+                                break
 
                         if (cfg.training.max_train_steps is not None) and batch_idx >= (
                             cfg.training.max_train_steps - 1
                         ):
                             break
+
+                if stop_training:
+                    break
 
                 # at the end of each epoch
                 # replace train_loss with epoch average
@@ -568,7 +602,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 accelerator.log(step_log, step=self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
+                save_step_checkpoint_if_due()
                 self.epoch += 1
+                if max_global_steps is not None and self.global_step >= int(max_global_steps):
+                    break
 
         accelerator.end_training()
 

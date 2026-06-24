@@ -1,0 +1,48 @@
+name: stack_green_hanoi_cube
+
+obs_horizon: 2
+action_horizon: 16
+
+dataset_path: /home/bike/Documents/niu/Dataset/test/hanoi_stack6.hdf5
+
+shape_meta: &shape_meta
+  obs:
+    rgb_0:
+      shape: [3, 224, 224]
+      type: rgb
+    rgb_1:
+      shape: [3, 224, 224]
+      type: rgb
+    joint_pos:
+      shape: [7]
+      type: low_dim
+
+  action:
+    shape: [7]
+
+  sample:
+    obs:
+      sparse:
+        rgb_0:
+          horizon: ${task.obs_horizon}
+          down_sample_steps: 1
+        rgb_1:
+          horizon: ${task.obs_horizon}
+          down_sample_steps: 1
+        joint_pos:
+          horizon: ${task.obs_horizon}
+          down_sample_steps: 1
+    action:
+      sparse:
+        horizon: ${task.action_horizon}
+        down_sample_steps: 1
+    training_duration_per_sparse_query: 600
+
+dataset:
+  _target_: diffusion_policy.dataset.yam_hdf5_dataset.YAMHdf5Dataset
+  dataset_path: ${task.dataset_path}
+  obs_horizon: ${task.obs_horizon}
+  action_horizon: ${task.action_horizon}
+  image_size: 224
+  val_ratio: 0.05
+  seed: 42

@@ -101,10 +101,12 @@ training:
   gradient_accumulate_every: 1
   # step limits (null = unlimited)
   max_train_steps: null
+  max_global_steps: null
   max_val_steps: null
   # logging / checkpointing cadence
   rollout_every: null
   checkpoint_every: 50
+  checkpoint_every_steps: null
   val_every: 10
   sample_every: 999999  # effectively never — newer diffusers DDIMScheduler.step() drops obs_as_cond kwarg
   tqdm_interval_sec: 1.0
