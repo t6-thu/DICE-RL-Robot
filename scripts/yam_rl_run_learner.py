@@ -50,12 +50,12 @@ if os.environ.get("YAM_RUN_NAME"):
     )
 
 learner = YAMRLLearner(
-    pretrained_policy_ckpt    = BC_POLICY_CKPT,
-    expert_npz_path           = EXPERT_NPZ,
+    pretrained_policy_ckpt    = getattr(cfg, "BC_POLICY_CKPT", BC_POLICY_CKPT),
+    expert_npz_path           = getattr(cfg, "EXPERT_NPZ", EXPERT_NPZ),
     online_data_dir           = getattr(cfg, "ONLINE_DATA_DIR", ONLINE_DATA_DIR),
     rl_checkpoint_dir         = getattr(cfg, "RL_CKPT_DIR", RL_CKPT_DIR),
-    hire_init_dir             = HIRE_INIT_DIR,
-    hire_expert_curation_path = HIRE_EXPERT_CURATION_PATH,
+    hire_init_dir             = getattr(cfg, "HIRE_INIT_DIR", HIRE_INIT_DIR),
+    hire_expert_curation_path = getattr(cfg, "HIRE_EXPERT_CURATION_PATH", HIRE_EXPERT_CURATION_PATH),
     **{**_training, **NETWORK, **COMM},
 )
 learner.run()

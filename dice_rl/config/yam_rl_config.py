@@ -95,17 +95,36 @@ _ckpt_dir  = os.environ.get("DICE_CHECKPOINT_FOLDERS",
 _data_dir  = os.environ.get("DICE_DATASET_FOLDERS",
                              os.path.expanduser("~/data/real_processed"))
 
+
+def _env_path(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    return os.path.expanduser(value)
+
+
+def _env_optional_path(name: str, default: str | None) -> str | None:
+    if name not in os.environ:
+        return default
+    value = os.environ.get(name, "").strip()
+    return os.path.expanduser(value) if value else None
+
+
 # ============================================================
 # TODO: set before running
 # ============================================================
-BC_POLICY_CKPT = os.path.expanduser(
+BC_POLICY_CKPT = _env_path("YAM_BC_POLICY_CKPT", os.path.expanduser(
     "~/training_outputs/2026.05.19/00.34.02_yam_vit_clip_v1_yam_picknplace_arizonabottle"
     "/checkpoints/epoch=0500-train_loss=0.013.ckpt"
+))
+EXPERT_NPZ = _env_path(
+    "YAM_EXPERT_NPZ",
+    os.path.join(_data_dir, "yam_picknplace_arizonabottle_224", "train.npz"),
 )
-EXPERT_NPZ = os.path.join(_data_dir,
-                          "yam_picknplace_arizonabottle_224", "train.npz")
-NORM_NPZ   = os.path.join(_data_dir,
-                          "yam_picknplace_arizonabottle_224", "normalization.npz")
+NORM_NPZ = _env_path(
+    "YAM_NORM_NPZ",
+    os.path.join(_data_dir, "yam_picknplace_arizonabottle_224", "normalization.npz"),
+)
 # ---- Run name ----
 # Change this string to spin up a fresh experiment without touching previous
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
@@ -113,7 +132,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
 # For Robometer-only reward runs, use a distinct name, e.g.:
 #   RUN_NAME = "robometer_libero_w1"
-RUN_NAME        = "robometer_2000_1000"
+RUN_NAME        = os.environ.get("YAM_RUN_NAME", "robometer_2000_1000").strip() or "robometer_2000_1000"
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -125,14 +144,16 @@ RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 # different *baseline* run, so we don't want its episodes to bias our HiRE
 # experiment. Fair comparison: HiRE starts with 0 online episodes, just
 # like the baseline did.)
-HIRE_INIT_DIR   = None
+HIRE_INIT_DIR   = _env_optional_path("YAM_HIRE_INIT_DIR", None)
 
 # Optional JSON file with `include`/`exclude` episode-index lists for the
 # offline expert npz. Produced by `python scripts/curate_expert.py`. When
 # present, ONLY the `include`'d expert trajectories are encoded into the
 # HiRE positive buffer. Set to None to use ALL expert trajectories.
-HIRE_EXPERT_CURATION_PATH = os.path.join(_data_dir,
-    "yam_picknplace_arizonabottle_224", "expert_curation.json")
+HIRE_EXPERT_CURATION_PATH = _env_optional_path(
+    "YAM_HIRE_EXPERT_CURATION_PATH",
+    os.path.join(os.path.dirname(EXPERT_NPZ), "expert_curation.json"),
+)
 
 # ============================================================
 # Training algorithm settings

@@ -278,8 +278,11 @@ class YAMRLEnvRunner:
 
     def _infer(self, obs_tensors) -> np.ndarray:
         """Run BC policy (+ optional residual actor) → (action_horizon, 7) raw i2rt."""
-        nobs = {k: self.bc_policy.sparse_normalizer[k].normalize(v)
-                for k, v in obs_tensors["sparse"].items()}
+        # _make_obs_tensors already maps joint_pos into the normalized RL action
+        # space used by the residual actor. Applying the BC policy normalizer
+        # again would double-normalize HDF5-trained policies whose checkpoint
+        # stores raw joint min/max.
+        nobs = obs_tensors["sparse"]
         features = self.bc_policy.obs_encoder(nobs)  # (1, feat_dim)
 
         noise = torch.randn(1, self.action_horizon, self.action_dim, device=self.device)

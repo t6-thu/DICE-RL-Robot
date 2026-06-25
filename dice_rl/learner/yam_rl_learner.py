@@ -587,8 +587,11 @@ class YAMRLLearner:
 
     def _encode_obs(self, obs: dict) -> torch.Tensor:
         """Run frozen BC policy encoder on obs, return (B, feature_dim)."""
-        nobs = {k: self.bc_policy.sparse_normalizer[k].normalize(v)
-                for k, v in obs.items()}
+        # Replay samples are stored in the normalized RL action/state space.
+        # Re-applying the BC checkpoint normalizer here double-normalizes
+        # HDF5-trained policies, while old NPZ-trained policies already used
+        # this same near-identity normalized space.
+        nobs = obs
         with torch.no_grad():
             return self.bc_policy.obs_encoder(nobs)
 

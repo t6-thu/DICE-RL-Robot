@@ -39,9 +39,13 @@ def _bool(name: str, default: bool) -> bool:
 def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
     """Overlay Robometer fields from YAM_ROBOMETER_* / legacy ROBOMETER_* env vars."""
     out = dict(training)
-    if os.environ.get("YAM_REWARD_MODE", "").strip().lower() == "robometer":
+    reward_mode = os.environ.get("YAM_REWARD_MODE", "").strip().lower()
+    if reward_mode == "robometer":
         out["use_hire_reward"] = False
         out["use_robometer_reward"] = True
+    elif reward_mode == "hire":
+        out["use_hire_reward"] = True
+        out["use_robometer_reward"] = False
 
     mapping = {
         "robometer_server_url": ("ROBOMETER_SERVER_URL", "YAM_ROBOMETER_SERVER_URL"),

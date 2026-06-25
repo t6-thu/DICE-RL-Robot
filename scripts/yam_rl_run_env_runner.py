@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO,
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from dice_rl.config import yam_rl_config as cfg
 from dice_rl.config.yam_env_overrides import apply_hardware_env_overrides
 from dice_rl.config.yam_rl_config import (
     BC_POLICY_CKPT, NORM_NPZ, ONLINE_DATA_DIR, RL_CKPT_DIR,
@@ -30,10 +31,10 @@ _p.add_argument("--max-joint-step", type=float, default=0.08,
 _args, _ = _p.parse_known_args()
 
 runner = YAMRLEnvRunner(
-    pretrained_policy_ckpt = BC_POLICY_CKPT,
-    norm_npz_path          = NORM_NPZ,
-    online_data_dir        = ONLINE_DATA_DIR,
-    rl_checkpoint_dir      = RL_CKPT_DIR,
+    pretrained_policy_ckpt = getattr(cfg, "BC_POLICY_CKPT", BC_POLICY_CKPT),
+    norm_npz_path          = getattr(cfg, "NORM_NPZ", NORM_NPZ),
+    online_data_dir        = getattr(cfg, "ONLINE_DATA_DIR", ONLINE_DATA_DIR),
+    rl_checkpoint_dir      = getattr(cfg, "RL_CKPT_DIR", RL_CKPT_DIR),
     actor_hidden_dims      = NETWORK["actor_hidden_dims"],
     residual_scale         = _args.residual_scale,
     max_joint_step         = _args.max_joint_step,

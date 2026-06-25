@@ -49,11 +49,14 @@ case "$ROLE" in
     echo "[isolated] learner → cores $HEAVY_CORES, nice +5, 8 threads"
     cd "$HERE"
     source ./prepare.sh
+    RUN_NAME="$(python -c 'from dice_rl.config.yam_rl_config import RUN_NAME; print(RUN_NAME)')"
+    RUN_DIR="$HOME/training_outputs/yam_rl_finetuning_${RUN_NAME}"
+    mkdir -p "$RUN_DIR"
     exec env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 \
       MALLOC_ARENA_MAX=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
       taskset -c "$HEAVY_CORES" nice -n 5 \
       python scripts/yam_rl_run_learner.py 2>&1 \
-        | tee -a "$HOME/training_outputs/yam_rl_finetuning_$(python3 -c 'from dice_rl.config.yam_rl_config import RUN_NAME;print(RUN_NAME)')/learner.log"
+        | tee -a "$RUN_DIR/learner.log"
     ;;
 
   envrunner)
