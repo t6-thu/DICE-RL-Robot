@@ -51,6 +51,14 @@ def _short_side_crop(rgb: np.ndarray, target: int = 256) -> np.ndarray:
 
 def _preprocess(rgb: np.ndarray) -> np.ndarray:
     """640×480 RGB uint8 → (3, 224, 224) float32 [0,1]."""
+    mode = os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop").strip().lower()
+    if mode in ("direct", "direct_resize", "resize"):
+        rgb224 = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
+        return np.transpose(rgb224, (2, 0, 1)).astype(np.float32) / 255.0
+    if mode not in ("center_crop", "centercrop", "crop"):
+        raise ValueError(
+            f"Unknown YAM_IMAGE_PREPROCESS={mode!r}; use center_crop or direct_resize"
+        )
     rgb256 = _short_side_crop(rgb, 256)
     t = torch.from_numpy(rgb256).permute(2,0,1).unsqueeze(0).float()
     t = torch.nn.functional.interpolate(t, (224,224), mode="bilinear", align_corners=False)
@@ -183,8 +191,14 @@ class YAMRLEnvRunner:
         self._last_weights_mtime = 0.0
         os.makedirs(online_data_dir, exist_ok=True)
         log.info(
-            "Env runner control: control_hz=%.1f residual_scale=%.3f max_joint_step=%.3f",
-            self.control_hz, self.residual_scale, self.max_joint_step)
+            "Env runner control: control_hz=%.1f residual_scale=%.3f "
+            "max_joint_step=%.3f max_episode_steps=%d action_horizon=%d",
+            self.control_hz, self.residual_scale, self.max_joint_step,
+            self.max_episode_steps, self.action_horizon)
+        log.info(
+            "Image preprocessing: %s",
+            os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop").strip().lower(),
+        )
 
         # ---- normalisation ----
         n = np.load(norm_npz_path)

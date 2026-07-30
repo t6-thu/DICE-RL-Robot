@@ -20,10 +20,22 @@ from pathlib import Path
 import cv2
 import h5py
 import numpy as np
+import torch
 
 
 DEFAULT_HDF5 = "/home/bike/Documents/niu/Dataset/test/hanoi_stack6.hdf5"
 DEFAULT_OUT = "~/data/real_processed/stack_green_hanoi_cube_224"
+
+
+def _resize_short_side_and_center_crop(rgb: np.ndarray, target: int = 256) -> np.ndarray:
+    h, w = rgb.shape[:2]
+    scale = max(target / w, target / h)
+    new_w = max(target, int(np.ceil(w * scale)))
+    new_h = max(target, int(np.ceil(h * scale)))
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    x0 = (new_w - target) // 2
+    y0 = (new_h - target) // 2
+    return resized[y0:y0 + target, x0:x0 + target]
 
 
 def _decode_chw(encoded, image_size: int) -> np.ndarray:
@@ -32,8 +44,16 @@ def _decode_chw(encoded, image_size: int) -> np.ndarray:
     if bgr is None:
         raise ValueError("OpenCV failed to decode JPEG frame")
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    if rgb.shape[:2] != (image_size, image_size):
-        rgb = cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_AREA)
+    rgb = _resize_short_side_and_center_crop(rgb, target=256)
+    if image_size > 0 and rgb.shape[:2] != (image_size, image_size):
+        rgb_t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float()
+        rgb_t = torch.nn.functional.interpolate(
+            rgb_t,
+            size=(image_size, image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return rgb_t.squeeze(0).clamp(0, 255).to(torch.uint8).numpy()
     return np.transpose(rgb, (2, 0, 1)).astype(np.uint8, copy=False)
 
 

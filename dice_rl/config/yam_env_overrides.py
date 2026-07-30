@@ -122,4 +122,6 @@ def apply_hardware_env_overrides(hardware: Dict[str, Any]) -> Dict[str, Any]:
         out["base_cam_serial"] = _str("YAM_BASE_CAM_SERIAL", out["base_cam_serial"])
     if os.environ.get("YAM_WRIST_CAM_SERIAL"):
         out["wrist_cam_serial"] = _str("YAM_WRIST_CAM_SERIAL", out["wrist_cam_serial"])
+    if os.environ.get("YAM_MAX_EPISODE_STEPS"):
+        out["max_episode_steps"] = _int("YAM_MAX_EPISODE_STEPS", out["max_episode_steps"])
     return out

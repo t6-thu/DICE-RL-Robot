@@ -109,6 +109,14 @@ def _resize_short_side_and_center_crop(rgb: np.ndarray, target: int = 256) -> np
 
 def _preprocess_for_policy(rgb: np.ndarray) -> np.ndarray:
     """640×480 RGB uint8 -> (3, 224, 224) float32 in [0, 1]."""
+    mode = os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop").strip().lower()
+    if mode in ("direct", "direct_resize", "resize"):
+        rgb224 = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
+        return np.transpose(rgb224, (2, 0, 1)).astype(np.float32) / 255.0
+    if mode not in ("center_crop", "centercrop", "crop"):
+        raise ValueError(
+            f"Unknown YAM_IMAGE_PREPROCESS={mode!r}; use center_crop or direct_resize"
+        )
     rgb_256 = _resize_short_side_and_center_crop(rgb, target=256)
     rgb_t = torch.from_numpy(rgb_256).permute(2, 0, 1).unsqueeze(0).float()
     rgb_t = torch.nn.functional.interpolate(rgb_t, size=(224, 224), mode="bilinear", align_corners=False)

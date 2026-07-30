@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /home/bike/Documents/niu/DICE-RL-Robot/hardware_interfaces/ 2>/dev/null; echo \"---\"; ls /home/bike/Documents/niu/i2rt/ 2>/dev/null)",
+      "Read(//home/bike/Documents/niu/i2rt/**)",
+      "Bash(uv venv *)",
+      "Bash(ls -la \"/home/bike/Documents/niu/RLinf/models/sft_logs/pi05_yam-two_cam-picknplace+discrete_state_TRUE-20260429-15:02:06/\" 2>&1 | head -10; echo \"---\"; find \"/home/bike/Documents/niu/RLinf/models/sft_logs/pi05_yam-two_cam-picknplace+discrete_state_TRUE\" -type f 2>/dev/null | head -30)",
+      "Read(//home/bike/Documents/niu/RLinf/models/sft_logs/pi05_yam-two_cam-picknplace+discrete_state_TRUE-20260429-15:02:06/**)",
+      "Read(//home/bike/Documents/niu/RLinf/models/sft_logs/pi05_yam-two_cam-picknplace+discrete_state_TRUE/**)",
+      "Bash(cat /home/bike/Documents/niu/RLinf/models/sft_logs/norm_stats.json | head -20; echo \"---\"; find /home/bike/Documents/niu/RLinf/examples/embodiment/config -name \"*yam*\" -o -name \"*pi05*real*\" 2>/dev/null | head -10)",
+      "Read(//home/bike/Documents/niu/RLinf/models/sft_logs/**)",
+      "Read(//home/bike/Documents/niu/RLinf/examples/embodiment/config/**)",
+      "Bash(find /home/bike/Documents/niu/RLinf/examples/embodiment/config -name \"*real*yam*\" -o -name \"*real*pi05*\" 2>/dev/null; echo \"---\"; grep -rln \"yam_policy\\\\|YamInputs\\\\|YamOutputs\" /home/bike/Documents/niu/RLinf/examples 2>/dev/null | head -5)",
+      "Read(//home/bike/Documents/niu/RLinf/examples/**)",
+      "Bash(ls /home/bike/Documents/niu/RLinf/.venv/lib/python3.11/site-packages/openpi/ 2>&1 | head -20; echo \"---\"; find /home/bike/Documents/niu/RLinf/.venv/lib/python3.11/site-packages/openpi/models_pytorch -maxdepth 2 -name \"*.py\" 2>/dev/null | head -10)",
+      "Read(//home/bike/Documents/niu/RLinf/.venv/lib/python3.11/site-packages/openpi/**)",
+      "Read(//home/bike/Documents/niu/RLinf/.venv/lib/python3.11/site-packages/openpi/models_pytorch/**)",
+      "Bash(ssh -p 30021 root@47.237.185.141 \"ls -lht /mnt/workspace/home/hzt/dice-rl/log_dir/yam-pretrain/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/2026-05-16_01-07-54_42/\")",
+      "Bash(ssh -p 30021 root@47.237.185.141 \"ls -lht /mnt/workspace/home/hzt/dice-rl/log_dir/yam-pretrain/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/2026-05-16_01-07-54_42/checkpoint/\")",
+      "Bash(ssh -p 30021 root@47.237.185.141 \"ls -la /mnt/workspace/home/hzt/dice-rl/log_dir/yam-pretrain/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/2026-05-16_01-07-54_42/ ; echo '---hydra---' ; ls -la /mnt/workspace/home/hzt/dice-rl/log_dir/yam-pretrain/yam_picknplace_paperplate_arizonabottle_pre_flow_matching_unet_img_ta16_td10/2026-05-16_01-07-54_42/.hydra/ 2>&1\")",
+      "Bash(ssh -p 30021 root@47.237.185.141 \"ls /mnt/workspace/home/hzt/dice-rl/ ; echo '---agent---' ; ls /mnt/workspace/home/hzt/dice-rl/agent/ 2>&1 | head ; echo '---model/flow_matching---' ; ls /mnt/workspace/home/hzt/dice-rl/model/flow_matching/ 2>&1 | head ; echo '---normalization---' ; ls -la /mnt/workspace/home/hzt/dice-rl/data_dir/yam/picknplace_paperplate_arizonabottle-img/pretrain/ 2>&1 | head\")"
+    ]
+  }
+}

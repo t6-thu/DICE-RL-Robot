@@ -28,6 +28,40 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 
 
+def _resize_short_side_and_center_crop(rgb: np.ndarray, target: int = 256) -> np.ndarray:
+    """Match the YAM deployment preprocessing used by eval/envrunner."""
+    h, w = rgb.shape[:2]
+    scale = max(target / w, target / h)
+    new_w = max(target, int(np.ceil(w * scale)))
+    new_h = max(target, int(np.ceil(h * scale)))
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    x0 = (new_w - target) // 2
+    y0 = (new_h - target) // 2
+    return resized[y0:y0 + target, x0:x0 + target]
+
+
+def _preprocess_rgb_chw(rgb: np.ndarray, image_size: int) -> np.ndarray:
+    """Camera RGB HWC uint8 -> CHW float32 [0, 1].
+
+    Bottle demonstrations were processed by preserving aspect ratio, center
+    cropping to 256x256, then bilinear resizing to the policy resolution.
+    Keep Hanoi on the same visual distribution.
+    """
+    rgb = _resize_short_side_and_center_crop(rgb, target=256)
+    if image_size > 0 and rgb.shape[:2] != (image_size, image_size):
+        rgb_t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float()
+        rgb_t = torch.nn.functional.interpolate(
+            rgb_t,
+            size=(image_size, image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        chw = rgb_t.squeeze(0).clamp(0, 255).numpy() / 255.0
+    else:
+        chw = np.transpose(rgb, (2, 0, 1)).astype(np.float32) / 255.0
+    return np.ascontiguousarray(chw.astype(np.float32, copy=False))
+
+
 class YAMHdf5Dataset(BaseImageDataset):
     def __init__(
         self,
@@ -132,14 +166,7 @@ class YAMHdf5Dataset(BaseImageDataset):
         if bgr is None:
             raise ValueError(f"Failed to decode {key}[{idx}] from {self.dataset_path}")
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        if self.image_size > 0 and rgb.shape[:2] != (self.image_size, self.image_size):
-            rgb = cv2.resize(
-                rgb,
-                (self.image_size, self.image_size),
-                interpolation=cv2.INTER_AREA,
-            )
-        chw = np.transpose(rgb, (2, 0, 1)).astype(np.float32) / 255.0
-        return np.ascontiguousarray(chw)
+        return _preprocess_rgb_chw(rgb, self.image_size)
 
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
         idx = self._val_indices if self._is_val else self._train_indices
