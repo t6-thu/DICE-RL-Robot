@@ -19,10 +19,10 @@ fi
 # This launcher is specifically for HiRE. Do not inherit a stale
 # YAM_REWARD_MODE=robometer from an old terminal session.
 export YAM_REWARD_MODE="hire"
-export YAM_RUN_NAME="${YAM_HANOI_RUN_NAME:-hire_stack_green_hanoi_cube_centercrop_epoch0500}"
-export YAM_BC_POLICY_CKPT="${YAM_HANOI_BC_POLICY_CKPT:-$HOME/training_outputs/stack_green_hanoi_cube_dp_centercrop}"
-export YAM_EXPERT_NPZ="${YAM_HANOI_EXPERT_NPZ:-$HOME/data/real_processed/stack_green_hanoi_cube_224/train.npz}"
-export YAM_NORM_NPZ="${YAM_HANOI_NORM_NPZ:-$HOME/data/real_processed/stack_green_hanoi_cube_224/normalization.npz}"
+export YAM_RUN_NAME="${YAM_HANOI_RUN_NAME:-hanoi_hire_npz_epoch0500_v1}"
+export YAM_BC_POLICY_CKPT="${YAM_HANOI_BC_POLICY_CKPT:-$HOME/training_outputs/stack_green_hanoi_cube_dp_npz_retrain/checkpoints/epoch=0500-train_loss=0.011.ckpt}"
+export YAM_EXPERT_NPZ="${YAM_HANOI_EXPERT_NPZ:-$HOME/文档/data/real_processed/stack_green_hanoi_cube_224/train.npz}"
+export YAM_NORM_NPZ="${YAM_HANOI_NORM_NPZ:-$HOME/文档/data/real_processed/stack_green_hanoi_cube_224/normalization.npz}"
 # Env runner counts diffusion-query chunks, not 30 Hz frames. Each chunk can
 # execute fewer than 16 waypoints when inference latency causes skipped steps,
 # so keep this comfortably above the demo horizon.

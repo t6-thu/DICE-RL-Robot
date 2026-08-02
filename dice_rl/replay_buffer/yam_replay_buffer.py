@@ -111,8 +111,9 @@ class YAMReplayBuffer:
         # Build valid (t, ep_start, ep_end_t) index triples for the expert
         # buffer.  Only include positions where a full action_horizon-step chunk
         # fits within the episode (mirrors BC training's valid index range).
-        # `ep_end_t` is the last valid t (= s + L - action_horizon), where the
-        # chunk actions[t:t+H] ends exactly at the episode's last frame.
+        # `ep_end_t` is the last valid t (= s + L - action_horizon - 1).
+        # This keeps next_obs at t+H inside the same episode and mirrors the
+        # online-buffer loop `for t in range(T - H)`.
         self._expert_indices = []
         for ep, (s, length) in enumerate(zip(ep_starts, self._expert_traj_lengths)):
             if ep not in include_set:
@@ -120,8 +121,8 @@ class YAMReplayBuffer:
             s = int(s); L = int(length)
             if L <= self.action_horizon:
                 continue  # episode too short to form even one valid chunk
-            ep_end_t = s + L - self.action_horizon   # last valid t with full H-step chunk
-            for t in range(s, s + L - self.action_horizon + 1):
+            ep_end_t = s + L - self.action_horizon - 1
+            for t in range(s, s + L - self.action_horizon):
                 self._expert_indices.append((t, s, ep_end_t))
         self._expert_indices = np.array(self._expert_indices, dtype=np.int64)
         log.info("Expert buffer: %d transitions from %d episodes (of %d total in npz)",
@@ -274,8 +275,8 @@ class YAMReplayBuffer:
             acts.append(self._expert_actions[t : t + H])
             # next_obs is one full action chunk ahead (t+H), matching the original
             # SequenceSampler which sets next_query_time = query_time + chunk_duration_ms.
-            # ep_end_t = s + L - H, so at the terminal t, next_obs lands on the
-            # episode's last frame exactly.
+            # ep_end_t = s + L - H - 1, so at the terminal t, next_obs lands on
+            # the episode's last frame exactly without crossing trajectories.
             is_terminal = (int(t) == int(ep_end_t))
             rews.append(1.0 if is_terminal else 0.0)
             dones.append(is_terminal)

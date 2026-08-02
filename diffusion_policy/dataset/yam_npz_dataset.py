@@ -61,11 +61,12 @@ class YAMNpzDataset(BaseImageDataset):
         ep_starts = np.concatenate([[0], np.cumsum(self.traj_lengths[:-1])])
         ep_ends = ep_starts + self.traj_lengths
 
-        # Build valid query indices: each query must have enough room for the
-        # full action horizon within the same episode.
+        # Build valid query indices for every frame in each episode. Near the
+        # episode end, action chunks are padded with the final action so terminal
+        # observations still supervise the policy instead of being dropped.
         indices = []
         for s, e in zip(ep_starts, ep_ends):
-            for t in range(s, e - action_horizon + 1):
+            for t in range(s, e):
                 indices.append(t)
         indices = np.array(indices, dtype=np.int64)
 
@@ -91,8 +92,10 @@ class YAMNpzDataset(BaseImageDataset):
 
         # Map each global step → episode start, for padding at episode start.
         self._ep_start_for = np.empty(len(self.states), dtype=np.int64)
+        self._ep_end_for = np.empty(len(self.states), dtype=np.int64)
         for s, e in zip(ep_starts, ep_ends):
             self._ep_start_for[s:e] = s
+            self._ep_end_for[s:e] = e
 
     # -------------------------------------------------------------------
     # Split support
@@ -142,8 +145,14 @@ class YAMNpzDataset(BaseImageDataset):
         rgb0 = img_seq[:, :3].astype(np.float32) / 255.0   # (T_obs, 3, 128, 128)
         rgb1 = img_seq[:, 3:].astype(np.float32) / 255.0
 
-        # Action chunk.
-        action_seq = self.actions[t : t + self.action_horizon]  # (T_act, 7)
+        # Action chunk. If the chunk runs past the episode end, repeat the
+        # final in-episode action. This keeps terminal observations in the
+        # dataset without crossing into the next demonstration.
+        ep_e = int(self._ep_end_for[t])
+        action_seq = self.actions[t : min(t + self.action_horizon, ep_e)]
+        if len(action_seq) < self.action_horizon:
+            pad = np.repeat(action_seq[-1:], self.action_horizon - len(action_seq), axis=0)
+            action_seq = np.concatenate([action_seq, pad], axis=0)
 
         obs_sparse: Dict[str, torch.Tensor] = {
             "rgb_0": torch.from_numpy(rgb0),      # (T_obs, 3, 128, 128)

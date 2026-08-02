@@ -15,6 +15,8 @@ Usage:
         --gripper_type linear_4310 \
         --base_serial  218622278369 \
         --wrist_serial 218622271309 \
+        --policy_camera_order wrist_base \
+        --weights ema \
         --home_joint_pos=-0.010,0.833,0.903,-0.598,-0.028,-0.029 \
         --skip_home --no_prompt --max_steps 100 --print_actions
 """
@@ -120,20 +122,74 @@ def _preprocess_for_policy(rgb: np.ndarray) -> np.ndarray:
     rgb_256 = _resize_short_side_and_center_crop(rgb, target=256)
     rgb_t = torch.from_numpy(rgb_256).permute(2, 0, 1).unsqueeze(0).float()
     rgb_t = torch.nn.functional.interpolate(rgb_t, size=(224, 224), mode="bilinear", align_corners=False)
-    return rgb_t.squeeze(0).clamp(0, 255).numpy() / 255.0  # (3, 224, 224) float [0,1]
+    # The Hanoi NPZ converter quantizes the resized frame to uint8 before the
+    # dataset divides by 255. Mirror that detail exactly at deployment.
+    rgb_u8 = rgb_t.squeeze(0).clamp(0, 255).to(torch.uint8).numpy()
+    return rgb_u8.astype(np.float32) / 255.0  # (3, 224, 224) float [0,1]
+
+
+def _pack_policy_images(
+    base: np.ndarray,
+    wrist: np.ndarray,
+    order: str,
+) -> np.ndarray:
+    """Pack physical camera frames into the checkpoint's rgb_0/rgb_1 order."""
+    if order == "base_wrist":
+        return np.concatenate([base, wrist], axis=0)
+    if order == "wrist_base":
+        return np.concatenate([wrist, base], axis=0)
+    raise ValueError(f"unknown policy camera order: {order!r}")
+
+
+def _split_physical_images(
+    packed: np.ndarray,
+    order: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (physical_base, physical_wrist) from a packed policy frame."""
+    if order == "base_wrist":
+        return packed[:3], packed[3:]
+    if order == "wrist_base":
+        return packed[3:], packed[:3]
+    raise ValueError(f"unknown policy camera order: {order!r}")
+
+
+def _camera_ages(
+    base_timestamp: float,
+    wrist_timestamp: float,
+    now: float | None = None,
+) -> tuple[float, float]:
+    now = time.monotonic() if now is None else float(now)
+    base_age = float("inf") if base_timestamp <= 0 else now - base_timestamp
+    wrist_age = float("inf") if wrist_timestamp <= 0 else now - wrist_timestamp
+    return base_age, wrist_age
 
 
 # ---- model loading -------------------------------------------------------
 
-def load_dp_policy(ckpt_path: str, device: torch.device):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+def _select_policy_state_dict(ckpt: dict, weights: str):
+    if weights not in {"ema", "model"}:
+        raise ValueError(f"weights must be 'ema' or 'model', got {weights!r}")
+    key = "ema_model" if weights == "ema" else "model"
+    state_dicts = ckpt.get("state_dicts", {})
+    if key not in state_dicts:
+        available = sorted(state_dicts)
+        raise KeyError(
+            f"checkpoint has no {key!r} weights; available state_dicts={available}"
+        )
+    return key, state_dicts[key]
+
+
+def load_dp_policy(ckpt_path: str, device: torch.device, weights: str = "ema"):
+    # Checkpoints also contain the other policy weights and optimizer state.
+    # Load the payload on CPU so those unused tensors do not consume GPU RAM.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg  = ckpt['cfg']
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     policy = hydra.utils.instantiate(cfg.policy)
-    policy.load_state_dict(ckpt['state_dicts']['model'])
+    weights_key, state_dict = _select_policy_state_dict(ckpt, weights)
+    policy.load_state_dict(state_dict)
     policy.to(device).eval()
-    log.info("loaded diffusion policy  epoch=%s  train_loss=%s",
-             cfg.get('epoch','?'), cfg.get('train_loss','?'))
+    log.info("loaded diffusion policy weights=%s", weights_key)
     return policy, cfg
 
 
@@ -157,6 +213,22 @@ def main():
                                  'yam_teaching_handle','no_gripper'])
     parser.add_argument('--base_serial',  required=True)
     parser.add_argument('--wrist_serial', required=True)
+    parser.add_argument(
+        '--weights',
+        choices=['ema', 'model'],
+        default='ema',
+        help='Checkpoint weights to deploy. EMA is the training-time eval policy.',
+    )
+    parser.add_argument(
+        '--policy_camera_order',
+        choices=['base_wrist', 'wrist_base'],
+        required=True,
+        help=(
+            'Mapping from physical cameras to policy tensor keys. '
+            'base_wrist means rgb_0=base/rgb_1=wrist; '
+            'wrist_base means rgb_0=wrist/rgb_1=base.'
+        ),
+    )
     parser.add_argument('--home_joint_pos', type=_parse_home, required=True)
     parser.add_argument('--home_gripper_pos', type=float, default=1.0)
     parser.add_argument('--device',       default='cuda')
@@ -166,6 +238,12 @@ def main():
     parser.add_argument('--ramp_seconds', type=float, default=8.0)
     parser.add_argument('--reset_seconds',type=float, default=4.0)
     parser.add_argument('--max_home_distance', type=float, default=0.5)
+    parser.add_argument(
+        '--max_camera_age',
+        type=float,
+        default=0.5,
+        help='Abort the episode if either policy camera frame is older than this many seconds.',
+    )
     parser.add_argument('--reset_on_exit', action='store_true', default=True)
     parser.add_argument('--no-reset_on_exit', dest='reset_on_exit', action='store_false')
     parser.add_argument('--skip_home',    action='store_true')
@@ -174,6 +252,11 @@ def main():
     parser.add_argument('--no-command_gripper', dest='command_gripper', action='store_false')
     parser.add_argument('--print_actions', action='store_true')
     parser.add_argument('--dry_run',      action='store_true')
+    parser.add_argument(
+        '--home_only',
+        action='store_true',
+        help='Move to the configured home pose and exit without policy execution.',
+    )
     parser.add_argument('--dump_obs_dir', default=None)
     args = parser.parse_args()
 
@@ -190,7 +273,7 @@ def main():
 
     # ---- load diffusion policy ------------------------------------------
     log.info("loading policy from %s …", args.ckpt)
-    policy, cfg = load_dp_policy(args.ckpt, device)
+    policy, cfg = load_dp_policy(args.ckpt, device, weights=args.weights)
     obs_horizon    = cfg.task.obs_horizon     # 2
     action_horizon = cfg.task.action_horizon  # 16
     act_steps      = action_horizon           # execute the full chunk before re-querying
@@ -205,22 +288,60 @@ def main():
     torch.cuda.synchronize()
     log.info("warmup done.")
 
+    # Start and validate cameras before opening the robot. RealSense startup can
+    # block for seconds; doing it after the YAM control thread starts can starve
+    # the motor watchdog and latch a "loss communication" error.
+    base_cam  = _SyncCamera(args.base_serial,  640, 480, 30, "base")
+    wrist_cam = _SyncCamera(args.wrist_serial, 640, 480, 30, "wrist")
+    try:
+        base_cam.start()
+        wrist_cam.start()
+    except Exception:
+        base_cam.stop()
+        wrist_cam.stop()
+        raise
+    deadline = time.monotonic() + 8.0
+    base_age = wrist_age = float("inf")
+    while time.monotonic() < deadline:
+        base_frame, base_t = base_cam.get()
+        wrist_frame, wrist_t = wrist_cam.get()
+        base_age, wrist_age = _camera_ages(base_t, wrist_t)
+        if (
+            base_frame is not None
+            and wrist_frame is not None
+            and base_age <= args.max_camera_age
+            and wrist_age <= args.max_camera_age
+        ):
+            break
+        time.sleep(0.05)
+    if base_age > args.max_camera_age or wrist_age > args.max_camera_age:
+        base_cam.stop()
+        wrist_cam.stop()
+        raise RuntimeError(
+            "cameras failed freshness check: "
+            f"base_age={base_age:.3f}s wrist_age={wrist_age:.3f}s "
+            f"limit={args.max_camera_age:.3f}s"
+        )
+    log.info(
+        "both cameras streaming; base_age=%.3fs wrist_age=%.3fs",
+        base_age,
+        wrist_age,
+    )
+
     # ---- hardware --------------------------------------------------------
     from i2rt.robots.get_robot import get_yam_robot, GripperType
     gripper_type = GripperType.from_string_name(args.gripper_type)
     log.info("opening YAM on %s with gripper=%s", args.can_channel, gripper_type)
-    robot = get_yam_robot(channel=args.can_channel, gripper_type=gripper_type, zero_gravity_mode=True)
-
-    base_cam  = _SyncCamera(args.base_serial,  640, 480, 30, "base")
-    wrist_cam = _SyncCamera(args.wrist_serial, 640, 480, 30, "wrist")
-    base_cam.start(); wrist_cam.start()
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if base_cam.get()[0] is not None and wrist_cam.get()[0] is not None: break
-        time.sleep(0.05)
-    if base_cam.get()[0] is None or wrist_cam.get()[0] is None:
-        log.error("cameras failed to produce frames"); sys.exit(1)
-    log.info("both cameras streaming.")
+    try:
+        robot = get_yam_robot(
+            channel=args.can_channel,
+            gripper_type=gripper_type,
+            zero_gravity_mode=True,
+        )
+    except Exception:
+        base_cam.stop()
+        wrist_cam.stop()
+        raise
 
     # ---- state reader ----------------------------------------------------
     def _read_state() -> np.ndarray:
@@ -251,6 +372,53 @@ def main():
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    def _close_hardware():
+        try:
+            base_cam.stop()
+            wrist_cam.stop()
+        except Exception:
+            pass
+        try:
+            robot.close()
+        except Exception as e:
+            log.warning("robot close failed: %s", e)
+
+    if args.home_only:
+        q_now = _read_state()
+        far = float(np.abs(q_now[:6] - args.home_joint_pos).max())
+        home = np.concatenate(
+            [args.home_joint_pos, [q_now[6]]],
+        ).astype(np.float64)
+        log.info(
+            "home-only: current=%s target=%s max|delta|=%.3f rad",
+            np.round(q_now, 3).tolist(),
+            np.round(home, 3).tolist(),
+            far,
+        )
+        if far > args.max_home_distance:
+            _close_hardware()
+            raise RuntimeError(
+                f"Refusing home-only move: max|delta|={far:.3f} rad exceeds "
+                f"--max_home_distance={args.max_home_distance:.3f}. "
+                "Inspect the robot and increase the threshold explicitly only "
+                "if the path is clear."
+            )
+        if not args.no_prompt:
+            answer = input(
+                f"Type MOVE to command a {args.ramp_seconds:.1f}s ramp to home: "
+            ).strip()
+            if answer != "MOVE":
+                log.info("home-only cancelled; no motion commanded.")
+                _close_hardware()
+                return
+        if args.dry_run:
+            log.info("home-only dry-run: no motion commanded.")
+        else:
+            robot.move_joints(home, time_interval_s=args.ramp_seconds)
+            log.info("home-only complete. q=%s", np.round(_read_state(), 3).tolist())
+        _close_hardware()
+        return
+
     period = 1.0 / args.control_hz
 
     # ---- episode loop ----------------------------------------------------
@@ -280,9 +448,23 @@ def main():
 
         # pre-fill history
         q0 = _read_state()
-        b0, _ = base_cam.get(); w0, _ = wrist_cam.get()
+        b0, bt0 = base_cam.get(); w0, wt0 = wrist_cam.get()
+        base_age, wrist_age = _camera_ages(bt0, wt0)
+        if (
+            b0 is None
+            or w0 is None
+            or base_age > args.max_camera_age
+            or wrist_age > args.max_camera_age
+        ):
+            _close_hardware()
+            raise RuntimeError(
+                "camera frame stale before episode: "
+                f"base_age={base_age:.3f}s wrist_age={wrist_age:.3f}s "
+                f"limit={args.max_camera_age:.3f}s"
+            )
         b0 = _preprocess_for_policy(b0);  w0 = _preprocess_for_policy(w0)
-        img0 = np.concatenate([b0, w0], axis=0)  # (6, 224, 224)
+        img0 = _pack_policy_images(b0, w0, args.policy_camera_order)
+        log.info("policy_camera_order=%s", args.policy_camera_order)
         for _ in range(obs_horizon):
             state_hist.append(q0.copy()); img_hist.append(img0.copy())
 
@@ -301,6 +483,21 @@ def main():
         for step in range(args.max_steps):
             if _abort["flag"]: break
 
+            # Fail closed if either RealSense pipeline has stopped updating.
+            _, base_t = base_cam.get()
+            _, wrist_t = wrist_cam.get()
+            base_age, wrist_age = _camera_ages(base_t, wrist_t)
+            if base_age > args.max_camera_age or wrist_age > args.max_camera_age:
+                log.error(
+                    "stale camera before inference: base_age=%.3fs wrist_age=%.3fs "
+                    "limit=%.3fs; aborting episode",
+                    base_age,
+                    wrist_age,
+                    args.max_camera_age,
+                )
+                _abort["flag"] = True
+                break
+
             # build cond from history (same roll-out pattern as flow-matching eval)
             q_hist_n = sn.normalize(np.stack(list(state_hist)))   # (To, 7) [-1,1]
             img_arr  = np.stack(list(img_hist))                    # (To, 6, 224, 224) [0,1]
@@ -318,21 +515,34 @@ def main():
             # result["sparse"] is in dice-rl [-1,1] action space; denorm to i2rt raw
             actions_n = result["sparse"][0].cpu().numpy()  # (action_horizon, 7)
             actions   = an.denormalize(actions_n)          # (action_horizon, 7) i2rt raw
+            g_norm = actions_n[:act_steps, 6]
+            g_raw = actions[:act_steps, 6]
 
             if args.print_actions:
-                log.info("[ep %d step %d] infer=%.1fms  q=%s  pred[0]=%s … [act-1]=%s",
+                log.info("[ep %d step %d] infer=%.1fms  q=%s  "
+                         "grip_norm[min,max,last]=[%.3f, %.3f, %.3f] "
+                         "grip_raw[min,max,last]=[%.3f, %.3f, %.3f]  "
+                         "pred[0]=%s … [act-1]=%s",
                          ep+1, step, infer_ms,
                          np.round(_read_state(), 3).tolist(),
+                         float(g_norm.min()), float(g_norm.max()), float(g_norm[-1]),
+                         float(g_raw.min()), float(g_raw.max()), float(g_raw[-1]),
                          np.round(actions[0], 3).tolist(),
                          np.round(actions[act_steps-1], 3).tolist())
             else:
-                log.info("[ep %d step %d] infer=%.1fms  q=%s", ep+1, step, infer_ms,
-                         np.round(_read_state(), 3).tolist())
+                log.info("[ep %d step %d] infer=%.1fms  q=%s  "
+                         "grip_raw[min,max,last]=[%.3f, %.3f, %.3f]",
+                         ep+1, step, infer_ms,
+                         np.round(_read_state(), 3).tolist(),
+                         float(g_raw.min()), float(g_raw.max()), float(g_raw[-1]))
 
             # optional obs dump
             if args.dump_obs_dir:
-                b_hwc = np.transpose(img_arr[-1, :3], (1,2,0))
-                w_hwc = np.transpose(img_arr[-1, 3:], (1,2,0))
+                physical_base, physical_wrist = _split_physical_images(
+                    img_arr[-1], args.policy_camera_order
+                )
+                b_hwc = np.transpose(physical_base, (1,2,0))
+                w_hwc = np.transpose(physical_wrist, (1,2,0))
                 cv2.imwrite(os.path.join(args.dump_obs_dir, f"step_{step:04d}_base.jpg"),
                             cv2.cvtColor((b_hwc*255).astype(np.uint8), cv2.COLOR_RGB2BGR))
                 cv2.imwrite(os.path.join(args.dump_obs_dir, f"step_{step:04d}_wrist.jpg"),
@@ -353,12 +563,25 @@ def main():
                 if not args.dry_run: robot.command_joint_pos(q_cmd)
 
                 # update history at 30 Hz
-                br, _ = base_cam.get(); wr, _ = wrist_cam.get()
+                br, br_t = base_cam.get(); wr, wr_t = wrist_cam.get()
+                base_age, wrist_age = _camera_ages(br_t, wr_t)
+                if base_age > args.max_camera_age or wrist_age > args.max_camera_age:
+                    log.error(
+                        "stale camera during action chunk: base_age=%.3fs "
+                        "wrist_age=%.3fs limit=%.3fs; aborting episode",
+                        base_age,
+                        wrist_age,
+                        args.max_camera_age,
+                    )
+                    _abort["flag"] = True
+                    break
                 if br is not None: br = _preprocess_for_policy(br)
                 if wr is not None: wr = _preprocess_for_policy(wr)
                 if br is not None and wr is not None:
                     state_hist.append(q_cur.copy())
-                    img_hist.append(np.concatenate([br, wr], axis=0))
+                    img_hist.append(
+                        _pack_policy_images(br, wr, args.policy_camera_order)
+                    )
 
         # ---- end of episode ------------------------------------------
         log.info("episode %d ended (%s)", ep+1, "aborted" if _abort["flag"] else "max_steps")
@@ -376,8 +599,7 @@ def main():
             if ans == "q": break
 
     log.info("shutting down…")
-    try: base_cam.stop(); wrist_cam.stop()
-    except: pass
+    _close_hardware()
 
 
 if __name__ == '__main__':
