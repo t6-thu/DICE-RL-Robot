@@ -9,6 +9,19 @@ from dice_rl.replay_buffer.yam_replay_buffer import YAMReplayBuffer
 
 
 class YAMReplayBufferBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def _write_expert(path: Path, episode_length: int = 5) -> None:
+        states = np.arange(episode_length * 7, dtype=np.float32).reshape(
+            episode_length, 7
+        )
+        np.savez(
+            path,
+            states=states,
+            actions=states.copy(),
+            images=np.zeros((episode_length, 6, 2, 2), dtype=np.uint8),
+            traj_lengths=np.array([episode_length], dtype=np.int64),
+        )
+
     def test_expert_next_obs_stays_inside_episode(self):
         """The terminal expert transition must not read the next trajectory."""
         with tempfile.TemporaryDirectory() as directory:
@@ -77,6 +90,88 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
                 4.0,
             )
             self.assertEqual(batch["action"][0, -1, 0].item(), 3.0)
+
+    def test_online_transitions_reference_one_compact_episode_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            expert_path = tmp_path / "expert.npz"
+            self._write_expert(expert_path)
+            replay = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(tmp_path / "online"),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                max_online_size=10,
+                device="cpu",
+            )
+
+            states = np.arange(3 * 7, dtype=np.float32).reshape(3, 7)
+            actions = 100 + states
+            images = np.zeros((3, 6, 2, 2), dtype=np.float32)
+            images[1] = 0.5
+            images[2] = 1.0
+            replay.add_episode({
+                "states": states,
+                "actions": actions,
+                "images": images,
+                "rewards": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "dones": np.array([False, False, True]),
+            })
+
+            self.assertEqual(list(replay._online), [(0, 0)])
+            self.assertEqual(len(replay._online_episodes), 1)
+            stored = replay._online_episodes[0]
+            self.assertEqual(stored["images"].dtype, np.uint8)
+            self.assertEqual(int(stored["images"][1, 0, 0, 0]), 128)
+            # Only unique episode arrays are retained; no materialised obs or
+            # next_obs dictionaries live in the transition ring.
+            self.assertLess(replay.online_storage_bytes, 2_000)
+
+            batch = replay._sample_online(1, torch.device("cpu"))
+            np.testing.assert_array_equal(
+                batch["action"][0].numpy(), actions[:2]
+            )
+            self.assertEqual(batch["reward"].item(), 1.0)
+            self.assertEqual(batch["done"].item(), 1.0)
+            self.assertEqual(
+                batch["next_obs"]["joint_pos"][0, -1, 0].item(),
+                states[2, 0],
+            )
+
+    def test_online_ring_eviction_releases_unreferenced_episode_arrays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            expert_path = tmp_path / "expert.npz"
+            self._write_expert(expert_path)
+            replay = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(tmp_path / "online"),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                max_online_size=3,
+                device="cpu",
+            )
+
+            def episode(offset):
+                states = offset + np.arange(5 * 7, dtype=np.float32).reshape(5, 7)
+                return {
+                    "states": states,
+                    "actions": states.copy(),
+                    "images": np.full((5, 6, 2, 2), offset, dtype=np.uint8),
+                    "rewards": np.zeros(5, dtype=np.float32),
+                    "dones": np.array([False, False, False, False, True]),
+                }
+
+            replay.add_episode(episode(1))
+            self.assertEqual(set(replay._online_episodes), {0})
+            replay.add_episode(episode(2))
+
+            self.assertEqual(len(replay._online), 3)
+            self.assertEqual(set(replay._online_episodes), {1})
+            self.assertEqual(set(ep_id for ep_id, _ in replay._online), {1})
+            self.assertEqual(replay._online_episode_refcounts, {1: 3})
 
 
 if __name__ == "__main__":
