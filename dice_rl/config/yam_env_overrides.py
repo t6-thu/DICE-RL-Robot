@@ -122,6 +122,14 @@ def apply_hardware_env_overrides(hardware: Dict[str, Any]) -> Dict[str, Any]:
         out["base_cam_serial"] = _str("YAM_BASE_CAM_SERIAL", out["base_cam_serial"])
     if os.environ.get("YAM_WRIST_CAM_SERIAL"):
         out["wrist_cam_serial"] = _str("YAM_WRIST_CAM_SERIAL", out["wrist_cam_serial"])
+    if os.environ.get("YAM_POLICY_CAMERA_ORDER"):
+        out["policy_camera_order"] = _str(
+            "YAM_POLICY_CAMERA_ORDER", out.get("policy_camera_order", "base_wrist")
+        )
     if os.environ.get("YAM_MAX_EPISODE_STEPS"):
         out["max_episode_steps"] = _int("YAM_MAX_EPISODE_STEPS", out["max_episode_steps"])
+    if os.environ.get("YAM_MAX_CAMERA_AGE"):
+        out["max_camera_age"] = _float(
+            "YAM_MAX_CAMERA_AGE", out.get("max_camera_age", 0.5)
+        )
     return out

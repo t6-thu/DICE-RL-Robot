@@ -71,6 +71,7 @@ class YAMReplayBuffer:
         robometer_shaper=None,
         use_sparse_for_online_success: bool = False,
         expert_curation_path: Optional[str] = None,
+        expected_policy_camera_order: Optional[str] = None,
     ) -> None:
         self.obs_horizon = obs_horizon
         self.action_dim = action_dim
@@ -86,6 +87,7 @@ class YAMReplayBuffer:
         # episodes always use the shaped reward. Offline expert demos use a
         # sparse +1 only on the terminal transition (matches online success).
         self.use_sparse_for_online_success = bool(use_sparse_for_online_success)
+        self.expected_policy_camera_order = expected_policy_camera_order
 
         # ---- expert buffer (preloaded from BC training npz) ----
         log.info("Loading expert data from %s", expert_npz_path)
@@ -174,6 +176,20 @@ class YAMReplayBuffer:
             reward   = R_sparse[t + action_horizon]               ← reward on arrival
             done     = D[t + action_horizon]
         """
+        if self.expected_policy_camera_order:
+            if "policy_camera_order" not in episode:
+                raise ValueError(
+                    "online episode is missing policy_camera_order metadata; "
+                    "discard it or collect it again with the aligned env runner"
+                )
+            actual_order = str(np.asarray(episode["policy_camera_order"]).item())
+            if actual_order != self.expected_policy_camera_order:
+                raise ValueError(
+                    "online episode camera order mismatch: "
+                    f"expected {self.expected_policy_camera_order!r}, "
+                    f"got {actual_order!r}"
+                )
+
         S = episode["states"]
         A = episode["actions"]
         R_sparse = np.asarray(episode["rewards"], dtype=np.float32)

@@ -43,7 +43,7 @@ def main():
     # Build HiRE shaper with the current TRAINING config
     enc = DinoV2Encoder(device=device)
     shaper = HireRewardShaper(
-        encoder=enc, cameras=("base", "wrist"),
+        encoder=enc, cameras=("rgb_0", "rgb_1"),
         reward_weight=TRAINING["hire_reward_weight"],
         contrastive_lambda=TRAINING["hire_contrastive_lambda"],
         logsumexp_beta_pos=TRAINING["hire_logsumexp_beta_pos"],

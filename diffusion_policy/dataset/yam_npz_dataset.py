@@ -8,8 +8,8 @@ The npz file contains:
 
 Batch format returned (matches train_diffusion_unet_image_workspace.py):
   obs.sparse:
-    rgb_0        (B, T_obs_img,  3, H, W)  base camera
-    rgb_1        (B, T_obs_img,  3, H, W)  wrist camera
+    rgb_0        (B, T_obs_img,  3, H, W)  source NPZ channels 0:3
+    rgb_1        (B, T_obs_img,  3, H, W)  source NPZ channels 3:6
     joint_pos    (B, T_obs_low, 7)         joint positions
   action.sparse  (B, T_action, 7)
 """
@@ -141,7 +141,8 @@ class YAMNpzDataset(BaseImageDataset):
         state_seq = self.states[obs_frames]   # (T_obs, 7)
         img_seq = self.images[obs_frames]     # (T_obs, 6, 128, 128)
 
-        # Split two cameras: channels 0-2 = base, 3-5 = wrist.
+        # Preserve the source NPZ camera order. Physical camera semantics are
+        # task-specific (for Hanoi: rgb_0=wrist, rgb_1=base).
         rgb0 = img_seq[:, :3].astype(np.float32) / 255.0   # (T_obs, 3, 128, 128)
         rgb1 = img_seq[:, 3:].astype(np.float32) / 255.0
 

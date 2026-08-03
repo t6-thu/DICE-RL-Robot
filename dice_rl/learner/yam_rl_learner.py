@@ -135,6 +135,7 @@ class YAMRLLearner:
         network_weight_topic: str = "rl_network_weights_topic",
         transitions_server_endpoint: str = "ipc:///tmp/feeds/rl_transitions",
         transitions_topic: str = "rl_transitions_topic",
+        expected_policy_camera_order: Optional[str] = None,
         # Misc
         device: str = "cuda",
         rl_checkpoint_dir: str = None,
@@ -265,7 +266,7 @@ class YAMRLLearner:
             _dino = DinoV2Encoder(device=device)
             self.hire_shaper = HireRewardShaper(
                 encoder=_dino,
-                cameras=("base", "wrist"),
+                cameras=("rgb_0", "rgb_1"),
                 reward_weight=hire_reward_weight,
                 contrastive_lambda=hire_contrastive_lambda,
                 logsumexp_beta_pos=hire_logsumexp_beta_pos,
@@ -314,9 +315,15 @@ class YAMRLLearner:
             hire_shaper=self.hire_shaper,
             robometer_shaper=self.robometer_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
-            expert_curation_path=hire_expert_curation_path,  # use 24 curated episodes for RL training
-                                                              # (same JSON as HiRE positive buffer above)
+            # Missing/None curation means all expert trajectories, matching DP.
+            expert_curation_path=hire_expert_curation_path,
+            expected_policy_camera_order=expected_policy_camera_order,
         )
+        if expected_policy_camera_order:
+            log.info(
+                "Online episode camera-order guard: %s",
+                expected_policy_camera_order,
+            )
 
         # ---- ZMQ communication ----
         self.learner_node = Learner(

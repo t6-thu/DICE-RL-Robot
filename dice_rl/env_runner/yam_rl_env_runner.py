@@ -62,7 +62,26 @@ def _preprocess(rgb: np.ndarray) -> np.ndarray:
     rgb256 = _short_side_crop(rgb, 256)
     t = torch.from_numpy(rgb256).permute(2,0,1).unsqueeze(0).float()
     t = torch.nn.functional.interpolate(t, (224,224), mode="bilinear", align_corners=False)
-    return t.squeeze(0).clamp(0,255).numpy() / 255.0
+    # Match process_hanoi_hdf5_to_npz.py exactly: bilinear resize, quantize to
+    # uint8, then divide by 255 in the dataset / online policy input.
+    rgb_u8 = t.squeeze(0).clamp(0,255).to(torch.uint8).numpy()
+    return rgb_u8.astype(np.float32) / 255.0
+
+
+def _pack_policy_images(base: np.ndarray, wrist: np.ndarray, order: str) -> np.ndarray:
+    """Pack physical cameras into the checkpoint's rgb_0/rgb_1 channel order."""
+    if order == "base_wrist":
+        return np.concatenate([base, wrist], axis=0)
+    if order == "wrist_base":
+        return np.concatenate([wrist, base], axis=0)
+    raise ValueError(f"unknown policy camera order: {order!r}")
+
+
+def _camera_ages(base_t: float, wrist_t: float, now: float = None):
+    now = time.monotonic() if now is None else float(now)
+    base_age = float("inf") if base_t <= 0 else now - base_t
+    wrist_age = float("inf") if wrist_t <= 0 else now - wrist_t
+    return base_age, wrist_age
 
 
 # ---- non-blocking camera (same as eval_dp_yam.py) ----
@@ -145,6 +164,7 @@ class YAMRLEnvRunner:
         # Cameras
         base_cam_serial: str,
         wrist_cam_serial: str,
+        policy_camera_order: str = "base_wrist",
         # YAM hardware
         can_channel: str = "can_follower_l",
         gripper_type: str = "linear_4310",
@@ -153,6 +173,7 @@ class YAMRLEnvRunner:
         # Control
         control_hz: float = 30.0,
         max_episode_steps: int = 200,
+        max_camera_age: float = 0.5,
         obs_horizon: int = 2,
         action_horizon: int = 16,
         action_dim: int = 7,
@@ -177,6 +198,13 @@ class YAMRLEnvRunner:
         self.control_hz = control_hz
         self.period = 1.0 / control_hz
         self.max_episode_steps = max_episode_steps
+        if policy_camera_order not in {"base_wrist", "wrist_base"}:
+            raise ValueError(
+                "policy_camera_order must be 'base_wrist' or 'wrist_base', "
+                f"got {policy_camera_order!r}"
+            )
+        self.policy_camera_order = policy_camera_order
+        self.max_camera_age = float(max_camera_age)
         self.home_joint_pos = np.array(home_joint_pos or [-0.01,0.833,0.903,-0.598,-0.028,-0.029],
                                        dtype=np.float32)
         self.home_gripper_pos = home_gripper_pos
@@ -199,6 +227,12 @@ class YAMRLEnvRunner:
             "Image preprocessing: %s",
             os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop").strip().lower(),
         )
+        log.info(
+            "Policy camera order: %s (rgb_0=%s rgb_1=%s)",
+            self.policy_camera_order,
+            "wrist" if self.policy_camera_order == "wrist_base" else "base",
+            "base" if self.policy_camera_order == "wrist_base" else "wrist",
+        )
 
         # ---- normalisation ----
         n = np.load(norm_npz_path)
@@ -208,12 +242,16 @@ class YAMRLEnvRunner:
 
         # ---- load frozen BC policy ----
         log.info("Loading BC policy from %s", pretrained_policy_ckpt)
-        self.bc_policy, _, _ = load_policy(pretrained_policy_ckpt, device)
+        self.bc_policy, _, bc_cfg = load_policy(pretrained_policy_ckpt, device)
         self.bc_policy.eval()
         for p in self.bc_policy.parameters():
             p.requires_grad = False
         obs_feature_dim = self.bc_policy.obs_feature_dim
-        log.info("BC policy obs_feature_dim=%d", obs_feature_dim)
+        log.info(
+            "BC policy obs_feature_dim=%d weights=%s",
+            obs_feature_dim,
+            "ema_model" if bc_cfg.training.use_ema else "model",
+        )
 
         # ---- residual actor (starts as None; filled when weights arrive) ----
         self.actor: Optional[DistilledActor] = None
@@ -242,8 +280,32 @@ class YAMRLEnvRunner:
             self.base_cam.stop()
             self.wrist_cam.stop()
             raise
-        time.sleep(1.0)
-        log.info("Cameras streaming.")
+        deadline = time.monotonic() + 8.0
+        base_age = wrist_age = float("inf")
+        while time.monotonic() < deadline:
+            b, bt = self.base_cam.get()
+            w, wt = self.wrist_cam.get()
+            base_age, wrist_age = _camera_ages(bt, wt)
+            if (
+                b is not None and w is not None
+                and base_age <= self.max_camera_age
+                and wrist_age <= self.max_camera_age
+            ):
+                break
+            time.sleep(0.05)
+        if base_age > self.max_camera_age or wrist_age > self.max_camera_age:
+            self.base_cam.stop()
+            self.wrist_cam.stop()
+            raise RuntimeError(
+                "camera freshness check failed before robot startup: "
+                f"base_age={base_age:.3f}s wrist_age={wrist_age:.3f}s "
+                f"limit={self.max_camera_age:.3f}s"
+            )
+        log.info(
+            "Cameras streaming: base_age=%.3fs wrist_age=%.3fs",
+            base_age,
+            wrist_age,
+        )
 
         # ---- hardware ----
         from i2rt.robots.get_robot import get_yam_robot, GripperType
@@ -257,16 +319,23 @@ class YAMRLEnvRunner:
             raise
 
         # ---- ZMQ ----
-        self.actor_node = Actor(
-            network_server_endpoint=network_server_endpoint,
-            network_weight_topic=network_weight_topic,
-            transitions_server_endpoint=transitions_server_endpoint,
-            transitions_topic=transitions_topic,
-            transitions_topic_expire_time_s=3600,
-        )
+        try:
+            self.actor_node = Actor(
+                network_server_endpoint=network_server_endpoint,
+                network_weight_topic=network_weight_topic,
+                transitions_server_endpoint=transitions_server_endpoint,
+                transitions_topic=transitions_topic,
+                transitions_topic_expire_time_s=3600,
+            )
+        except Exception:
+            self.base_cam.stop()
+            self.wrist_cam.stop()
+            self.robot.close()
+            raise
 
         self._abort_episode  = {"flag": False}
         self._in_episode     = False
+        self._closed         = False
         self._last_sigint_t  = 0.0   # debounce: ignore rapid duplicate SIGINTs
         self._actor_step     = 0
         signal.signal(signal.SIGINT,  self._sigint)
@@ -326,19 +395,30 @@ class YAMRLEnvRunner:
         # CAN adapter) can intermittently return None; retry for up to 5s instead
         # of crashing the whole run on a single dropped frame.
         q0 = self._read_state()
-        b, _ = self.base_cam.get(); w, _ = self.wrist_cam.get()
+        b, bt = self.base_cam.get(); w, wt = self.wrist_cam.get()
         deadline = time.monotonic() + 5.0
-        while (b is None or w is None) and time.monotonic() < deadline:
+        base_age, wrist_age = _camera_ages(bt, wt)
+        while (
+            b is None or w is None
+            or base_age > self.max_camera_age
+            or wrist_age > self.max_camera_age
+        ) and time.monotonic() < deadline:
             time.sleep(0.05)
-            b, _ = self.base_cam.get(); w, _ = self.wrist_cam.get()
-        if b is None or w is None:
+            b, bt = self.base_cam.get(); w, wt = self.wrist_cam.get()
+            base_age, wrist_age = _camera_ages(bt, wt)
+        if (
+            b is None or w is None
+            or base_age > self.max_camera_age
+            or wrist_age > self.max_camera_age
+        ):
             raise RuntimeError(
-                "camera frames unavailable after 5s "
+                "camera frames unavailable/stale after 5s "
                 f"(base={'ok' if b is not None else 'None'}, "
-                f"wrist={'ok' if w is not None else 'None'}) — "
+                f"wrist={'ok' if w is not None else 'None'}, "
+                f"base_age={base_age:.3f}s, wrist_age={wrist_age:.3f}s) — "
                 "check USB connection / move wrist cam to a USB-3 port")
         b = _preprocess(b); w = _preprocess(w)
-        img0 = np.concatenate([b, w], axis=0)  # (6, 224, 224)
+        img0 = _pack_policy_images(b, w, self.policy_camera_order)
         state_hist = deque([q0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
         img_hist   = deque([img0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
         last_cmd = q0.astype(np.float64).copy()
@@ -357,10 +437,22 @@ class YAMRLEnvRunner:
             # but by then the robot has continued converging toward that step's
             # target. The fresh read here captures the actual current position.
             q_pre = self._read_state()
-            br_pre, _ = self.base_cam.get(); wr_pre, _ = self.wrist_cam.get()
+            br_pre, br_pre_t = self.base_cam.get()
+            wr_pre, wr_pre_t = self.wrist_cam.get()
+            base_age, wrist_age = _camera_ages(br_pre_t, wr_pre_t)
+            if base_age > self.max_camera_age or wrist_age > self.max_camera_age:
+                log.error(
+                    "stale camera before inference: base_age=%.3fs wrist_age=%.3fs "
+                    "limit=%.3fs; aborting episode",
+                    base_age, wrist_age, self.max_camera_age,
+                )
+                self._abort_episode["flag"] = True
+                break
             if br_pre is not None and wr_pre is not None:
                 b_p = _preprocess(br_pre); w_p = _preprocess(wr_pre)
-                img_pre = np.concatenate([b_p, w_p], axis=0)
+                img_pre = _pack_policy_images(
+                    b_p, w_p, self.policy_camera_order
+                )
                 state_hist.append(q_pre.copy())
                 img_hist.append(img_pre.copy())
 
@@ -402,10 +494,21 @@ class YAMRLEnvRunner:
                 q_cur = self._read_state()
 
                 # update obs history at 30 Hz
-                br, _ = self.base_cam.get(); wr, _ = self.wrist_cam.get()
+                br, br_t = self.base_cam.get(); wr, wr_t = self.wrist_cam.get()
+                base_age, wrist_age = _camera_ages(br_t, wr_t)
+                if base_age > self.max_camera_age or wrist_age > self.max_camera_age:
+                    log.error(
+                        "stale camera during action chunk: base_age=%.3fs "
+                        "wrist_age=%.3fs limit=%.3fs; aborting episode",
+                        base_age, wrist_age, self.max_camera_age,
+                    )
+                    self._abort_episode["flag"] = True
+                    break
                 if br is not None and wr is not None:
                     b_p = _preprocess(br); w_p = _preprocess(wr)
-                    img_cur = np.concatenate([b_p, w_p], axis=0)
+                    img_cur = _pack_policy_images(
+                        b_p, w_p, self.policy_camera_order
+                    )
                     state_hist.append(q_cur.copy())
                     img_hist.append(img_cur.copy())
 
@@ -436,10 +539,11 @@ class YAMRLEnvRunner:
             "discard":  False,
             "images":   np.stack(images_rec).astype(np.float32),  # (T,6,H,W) [0,1]
             "states":   np.stack(states_rec).astype(np.float32),  # (T,7) norm
-            "actions":  np.stack(actions_rec).astype(np.float32), # (T,H,7) norm
+            "actions":  np.stack(actions_rec).astype(np.float32), # (T,7) norm
             "rewards":  rewards,
             "dones":    dones,
             "success":  reward_val > 0.5,
+            "policy_camera_order": np.asarray(self.policy_camera_order),
         }
 
     # ---- main loop ----
@@ -452,10 +556,41 @@ class YAMRLEnvRunner:
         time.sleep(0.3)
         log.info("At home. q=%s", np.round(self._read_state(), 3).tolist())
 
+    def close(self) -> None:
+        """Stop cameras and release robot torque exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.base_cam.stop()
+            self.wrist_cam.stop()
+        except Exception as exc:
+            log.warning("camera shutdown failed: %s", exc)
+        if self.robot is not None:
+            try:
+                self.robot.close()
+            except Exception as exc:
+                log.warning("robot shutdown failed: %s", exc)
+
     def run(self) -> None:
+        try:
+            self._run_loop()
+        except KeyboardInterrupt:
+            log.info("Interrupted; shutting down safely.")
+        finally:
+            self.close()
+
+    def _run_loop(self) -> None:
         log.info("Env runner ready.")
 
-        # Auto-home before the very first episode.
+        # Require an explicit acknowledgement before the first physical move.
+        q_now = self._read_state()
+        home = np.concatenate([self.home_joint_pos, [self.home_gripper_pos]])
+        max_delta = float(np.max(np.abs(q_now - home)))
+        log.info("Initial home check: max|delta|=%.3f rad", max_delta)
+        confirm = input("Type MOVE to command a 6.0s ramp to home: ").strip()
+        if confirm != "MOVE":
+            raise RuntimeError("home motion cancelled (expected exact input: MOVE)")
         self._move_to_home()
 
         # Count already-saved episodes so numbering stays consistent across restarts.
@@ -469,6 +604,10 @@ class YAMRLEnvRunner:
             actor_info = (f"RL actor step={self._actor_step}"
                          if self.actor is not None else "pure BC")
             input(f"\n[Episode {ep+1} | {actor_info}] Press Enter to start, or Ctrl-C to exit.")
+            # The learner may finish a training round while the operator is
+            # waiting at this prompt. Recheck immediately before rollout so
+            # episode 21 does not accidentally remain pure BC.
+            self._try_update_actor()
             ep_data = self.run_episode()
             if ep_data.get("discard"):
                 log.info("Episode discarded.")
@@ -486,11 +625,14 @@ class YAMRLEnvRunner:
                                 states=ep_data["states"],
                                 actions=ep_data["actions"],
                                 rewards=ep_data["rewards"],
-                                dones=ep_data["dones"])
+                                dones=ep_data["dones"],
+                                policy_camera_order=np.asarray(self.policy_camera_order))
 
-            # Send episode to learner (send_transitions pickles internally — do NOT pre-pickle).
-            self.actor_node.send_transitions(ep_data)
-            log.info("Episode %d saved+sent (success=%s)", ep+1, ep_data["success"])
+            # Disk is the authoritative transport for YAMRLLearner. Avoid also
+            # pickling/sending the float32 image tensor through ZMQ: a full
+            # real-robot episode can be hundreds of MB and the learner's active
+            # loop intentionally does not consume that queue.
+            log.info("Episode %d saved (success=%s)", ep+1, ep_data["success"])
             ep += 1
 
             # Auto-home at end of every episode (ready for the next one).
@@ -536,12 +678,11 @@ class YAMRLEnvRunner:
             log.info("Ctrl-C: aborting episode. Use Ctrl-\\ to force-quit.")
             self._abort_episode["flag"] = True
         else:
-            log.info("Ctrl-C: exiting.")
-            os._exit(130)
+            raise KeyboardInterrupt
 
     def _sigterm(self, *_) -> None:
-        log.info("SIGTERM received: force-quitting.")
-        os._exit(0)
+        log.info("SIGTERM received; shutting down safely.")
+        raise SystemExit(0)
 
     def _sigquit(self, *_) -> None:
         log.info("Ctrl-\\ received: hard-killing immediately.")

@@ -56,6 +56,7 @@ learner = YAMRLLearner(
     rl_checkpoint_dir         = getattr(cfg, "RL_CKPT_DIR", RL_CKPT_DIR),
     hire_init_dir             = getattr(cfg, "HIRE_INIT_DIR", HIRE_INIT_DIR),
     hire_expert_curation_path = getattr(cfg, "HIRE_EXPERT_CURATION_PATH", HIRE_EXPERT_CURATION_PATH),
+    expected_policy_camera_order = os.environ.get("YAM_POLICY_CAMERA_ORDER") or None,
     **{**_training, **NETWORK, **COMM},
 )
 learner.run()

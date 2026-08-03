@@ -3,7 +3,7 @@
 #
 # Usage in two terminals:
 #   bash scripts/launch_hanoi_hire.sh learner
-#   bash scripts/launch_hanoi_hire.sh envrunner --residual-scale 0.1 --max-joint-step 0.04
+#   bash scripts/launch_hanoi_hire.sh envrunner --residual-scale 0.1
 
 set -e
 
@@ -19,14 +19,17 @@ fi
 # This launcher is specifically for HiRE. Do not inherit a stale
 # YAM_REWARD_MODE=robometer from an old terminal session.
 export YAM_REWARD_MODE="hire"
-export YAM_RUN_NAME="${YAM_HANOI_RUN_NAME:-hanoi_hire_npz_epoch0500_v1}"
-export YAM_BC_POLICY_CKPT="${YAM_HANOI_BC_POLICY_CKPT:-$HOME/training_outputs/stack_green_hanoi_cube_dp_npz_retrain/checkpoints/epoch=0500-train_loss=0.011.ckpt}"
+export YAM_RUN_NAME="${YAM_HANOI_RUN_NAME:-hanoi_hire_npz_epoch0500_wristbase_v2}"
+export YAM_BC_POLICY_CKPT="${YAM_HANOI_BC_POLICY_CKPT:-$HOME/training_outputs/stack_green_hanoi_cube_dp_npz_retrain/checkpoints/latest.ckpt}"
 export YAM_EXPERT_NPZ="${YAM_HANOI_EXPERT_NPZ:-$HOME/文档/data/real_processed/stack_green_hanoi_cube_224/train.npz}"
 export YAM_NORM_NPZ="${YAM_HANOI_NORM_NPZ:-$HOME/文档/data/real_processed/stack_green_hanoi_cube_224/normalization.npz}"
+export YAM_POLICY_CAMERA_ORDER="wrist_base"
+export YAM_IMAGE_PREPROCESS="center_crop"
+export YAM_MAX_CAMERA_AGE="${YAM_MAX_CAMERA_AGE:-0.5}"
 # Env runner counts diffusion-query chunks, not 30 Hz frames. Each chunk can
 # execute fewer than 16 waypoints when inference latency causes skipped steps,
 # so keep this comfortably above the demo horizon.
-export YAM_MAX_EPISODE_STEPS="${YAM_MAX_EPISODE_STEPS:-80}"
+export YAM_MAX_EPISODE_STEPS="${YAM_MAX_EPISODE_STEPS:-36}"
 : "${YAM_HIRE_EXPERT_CURATION_PATH:=}"
 export YAM_HIRE_EXPERT_CURATION_PATH
 
@@ -49,5 +52,6 @@ echo "[hanoi-hire] bc=$YAM_BC_POLICY_CKPT"
 echo "[hanoi-hire] expert=$YAM_EXPERT_NPZ"
 echo "[hanoi-hire] norm=$YAM_NORM_NPZ"
 echo "[hanoi-hire] max_episode_steps=$YAM_MAX_EPISODE_STEPS"
+echo "[hanoi-hire] camera_order=$YAM_POLICY_CAMERA_ORDER preprocess=$YAM_IMAGE_PREPROCESS max_camera_age=$YAM_MAX_CAMERA_AGE"
 
 exec bash "$HERE/scripts/launch_isolated.sh" "$ROLE" "$@"

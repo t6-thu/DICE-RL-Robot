@@ -291,9 +291,8 @@ NETWORK = dict(
 # ============================================================
 # Cameras (RealSense serials + logical names used in code)
 # ============================================================
-# YAM RL stores each frame as images[t] shape (6, H, W):
-#   channels 0:3  ← base / fixed third-person  → policy key rgb_0, env_runner base_cam
-#   channels 3:6  ← wrist                     → policy key rgb_1, env_runner wrist_cam
+# YAM RL stores each frame in the BC checkpoint's rgb_0/rgb_1 order. The
+# physical-camera mapping is task-specific; Hanoi uses wrist_base.
 #
 # HiRE-Dice_RL (sim) uses robometer_camera_key in {agentview_image, sideview_image, ...}.
 # On real YAM the analogue is robometer_camera in {base, wrist} (or rgb_0, rgb_1).
@@ -315,10 +314,12 @@ HARDWARE = dict(
     gripper_type      = "linear_4310",
     base_cam_serial   = CAMERAS["base_cam_serial"],
     wrist_cam_serial  = CAMERAS["wrist_cam_serial"],
+    policy_camera_order = "base_wrist",
     home_joint_pos    = [-0.010, 0.833, 0.903, -0.598, -0.028, -0.029],
     home_gripper_pos  = 1.0,
     control_hz        = 30.0,
     max_episode_steps = 200,
+    max_camera_age    = 0.5,
 )
 
 # ============================================================

@@ -10,7 +10,8 @@ Ports the contrastive-prompt PBRS recipe from the simulation codebase
 `sim_X(s)` is a logsumexp-smooth-max over `K` cosine-similarities between
 DINOv2 patch embeddings of the current observation and a buffer of
 positive / negative reference embeddings. Similarities are computed
-independently for the base and wrist cameras and summed.
+independently for policy inputs rgb_0 and rgb_1 and summed; their physical
+camera meanings are task-specific.
 
 Buffers
 -------
@@ -40,6 +41,20 @@ log = logging.getLogger(__name__)
 
 # Pin the DINOv2 hub commit so behaviour matches the dice-rl reference.
 _DINOV2_COMMIT = "b48308a394a04ccb9c4dd3a1f0a4daa1ce0579b8"
+
+
+def _as_float01_images(images: np.ndarray) -> np.ndarray:
+    """Return image tensors as float32 [0, 1] without changing channel order."""
+    images = np.asarray(images)
+    if images.dtype == np.uint8:
+        return images.astype(np.float32) / 255.0
+    result = images.astype(np.float32, copy=False)
+    if result.size and (result.min() < 0.0 or result.max() > 1.0):
+        raise ValueError(
+            "float HiRE images must be in [0, 1], "
+            f"got min={result.min():.4f} max={result.max():.4f}"
+        )
+    return result
 
 
 class DinoV2Encoder(nn.Module):
@@ -102,7 +117,7 @@ class HireRewardShaper:
     def __init__(
         self,
         encoder: DinoV2Encoder,
-        cameras: List[str] = ("base", "wrist"),
+        cameras: List[str] = ("rgb_0", "rgb_1"),
         reward_weight: float = 1.0,
         contrastive_lambda: float = 0.1,
         logsumexp_beta_pos: float = 10.0,   # sharp max for positives
@@ -218,11 +233,11 @@ class HireRewardShaper:
                                frame_indices: np.ndarray):
         """Encode selected frames from one episode for both cameras.
 
-        Returns (feats_base_NPD, feats_wrist_NPD).
+        Returns (feats_rgb0_NPD, feats_rgb1_NPD).
         """
-        sel = images_T6HW_f01[frame_indices]            # (n, 6, H, W)
-        base  = torch.from_numpy(sel[:, :3]).float()     # (n, 3, H, W)
-        wrist = torch.from_numpy(sel[:, 3:]).float()
+        sel = _as_float01_images(images_T6HW_f01[frame_indices])
+        rgb0 = torch.from_numpy(sel[:, :3]).float()     # (n, 3, H, W)
+        rgb1 = torch.from_numpy(sel[:, 3:]).float()
 
         # Encode in mini-batches to keep memory bounded
         def _batched(x):
@@ -231,7 +246,7 @@ class HireRewardShaper:
                 outs.append(self.encoder.encode(x[i:i + self.encode_batch_size]))
             return torch.cat(outs, dim=0) if outs else torch.empty(0, device=self.device)
 
-        return _batched(base), _batched(wrist)
+        return _batched(rgb0), _batched(rgb1)
 
     @torch.no_grad()
     def add_episode_to_buffer(self, images_T6HW_f01: np.ndarray, success: bool) -> int:
@@ -256,10 +271,10 @@ class HireRewardShaper:
             target_buf = self.neg_buffer
             cap        = self.max_neg_buffer_size
         frame_idx = np.arange(T - n, T, dtype=np.int64)
-        feats_base, feats_wrist = self._encode_episode_frames(
+        feats_rgb0, feats_rgb1 = self._encode_episode_frames(
             images_T6HW_f01, frame_idx)
-        self._append_to_buffer(target_buf, "base",  feats_base,  cap=cap)
-        self._append_to_buffer(target_buf, "wrist", feats_wrist, cap=cap)
+        self._append_to_buffer(target_buf, "rgb_0", feats_rgb0, cap=cap)
+        self._append_to_buffer(target_buf, "rgb_1", feats_rgb1, cap=cap)
         return n
 
     @torch.no_grad()
@@ -357,12 +372,12 @@ class HireRewardShaper:
                 sel = sel.astype(np.float32) / 255.0
             else:
                 sel = sel.astype(np.float32)
-            base  = torch.from_numpy(sel[:, :3])
-            wrist = torch.from_numpy(sel[:, 3:])
-            self._append_to_buffer(self.pos_buffer_expert, "base",
-                                   self.encoder.encode(base),  cap=cap)
-            self._append_to_buffer(self.pos_buffer_expert, "wrist",
-                                   self.encoder.encode(wrist), cap=cap)
+            rgb0 = torch.from_numpy(sel[:, :3])
+            rgb1 = torch.from_numpy(sel[:, 3:])
+            self._append_to_buffer(self.pos_buffer_expert, "rgb_0",
+                                   self.encoder.encode(rgb0), cap=cap)
+            self._append_to_buffer(self.pos_buffer_expert, "rgb_1",
+                                   self.encoder.encode(rgb1), cap=cap)
             added += sel.shape[0]
         log.info("HiRE: pos_buffer_expert after expert: %s",
                  {c: tuple(self.pos_buffer_expert[c].shape)
@@ -445,29 +460,29 @@ class HireRewardShaper:
         T = int(images_T6HW_f01.shape[0])
         if T == 0:
             return np.zeros(0, dtype=np.float32)
-        imgs = torch.from_numpy(images_T6HW_f01.astype(np.float32))
-        base  = imgs[:, :3]
-        wrist = imgs[:, 3:]
-        f_base  = self.encoder.encode(base)
-        f_wrist = self.encoder.encode(wrist)
+        imgs = torch.from_numpy(_as_float01_images(images_T6HW_f01))
+        rgb0 = imgs[:, :3]
+        rgb1 = imgs[:, 3:]
+        f_rgb0 = self.encoder.encode(rgb0)
+        f_rgb1 = self.encoder.encode(rgb1)
 
         sim_total = torch.zeros(T, device=self.device)
         # Re-sample K from each buffer once per episode (paper does so per step
         # but per-episode sampling is much faster and statistically similar).
         # Positives are drawn ratio-wise from online-success vs offline-expert
         # (see _pos_buffer_for_sampling — online_pos_ratio controls the mix).
-        pos_b = self._pos_buffer_for_sampling("base")
-        neg_b = self._sample_buffer(self.neg_buffer.get("base"))
-        pos_w = self._pos_buffer_for_sampling("wrist")
-        neg_w = self._sample_buffer(self.neg_buffer.get("wrist"))
+        pos_0 = self._pos_buffer_for_sampling("rgb_0")
+        neg_0 = self._sample_buffer(self.neg_buffer.get("rgb_0"))
+        pos_1 = self._pos_buffer_for_sampling("rgb_1")
+        neg_1 = self._sample_buffer(self.neg_buffer.get("rgb_1"))
 
-        if "base" in self.cameras:
-            sp = self._sim_to_targets(f_base, pos_b, beta=self.logsumexp_beta_pos)
-            sn = self._sim_to_targets(f_base, neg_b, beta=self.logsumexp_beta_neg)
+        if "rgb_0" in self.cameras:
+            sp = self._sim_to_targets(f_rgb0, pos_0, beta=self.logsumexp_beta_pos)
+            sn = self._sim_to_targets(f_rgb0, neg_0, beta=self.logsumexp_beta_neg)
             sim_total = sim_total + (sp - self.contrastive_lambda * sn)
-        if "wrist" in self.cameras:
-            sp = self._sim_to_targets(f_wrist, pos_w, beta=self.logsumexp_beta_pos)
-            sn = self._sim_to_targets(f_wrist, neg_w, beta=self.logsumexp_beta_neg)
+        if "rgb_1" in self.cameras:
+            sp = self._sim_to_targets(f_rgb1, pos_1, beta=self.logsumexp_beta_pos)
+            sn = self._sim_to_targets(f_rgb1, neg_1, beta=self.logsumexp_beta_neg)
             sim_total = sim_total + (sp - self.contrastive_lambda * sn)
 
         phi = self.reward_weight * sim_total
