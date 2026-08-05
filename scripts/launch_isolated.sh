@@ -20,6 +20,7 @@
 #   bash scripts/launch_isolated.sh server      # robometer eval server
 #   bash scripts/launch_isolated.sh learner     # DICE-RL learner
 #   bash scripts/launch_isolated.sh envrunner   # robot env runner
+#   bash scripts/launch_isolated.sh eval        # interactive checkpoint eval
 #
 # If the robometer server is ALREADY running, you don't need to restart it —
 # just rebind it live (this script's `rebind <PID>` does that):
@@ -68,6 +69,15 @@ case "$ROLE" in
       taskset -c "$ENV_CORES" python scripts/yam_rl_run_env_runner.py "$@"
     ;;
 
+  eval)
+    echo "[isolated] checkpoint eval → cores $ENV_CORES (dedicated robot control)"
+    cd "$HERE"
+    source ./prepare.sh
+    exec env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+      OPENCV_FOR_THREADS_NUM=1 PYTHONUNBUFFERED=1 \
+      taskset -c "$ENV_CORES" python scripts/eval_ckpt.py "$@"
+    ;;
+
   rebind)
     PID="$2"
     [ -z "$PID" ] && { echo "usage: $0 rebind <PID>"; exit 1; }
@@ -78,7 +88,7 @@ case "$ROLE" in
     ;;
 
   *)
-    echo "usage: $0 {server|learner|envrunner|rebind <PID>}"
+    echo "usage: $0 {server|learner|envrunner|eval|rebind <PID>}"
     exit 1
     ;;
 esac

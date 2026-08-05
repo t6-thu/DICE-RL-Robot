@@ -2,6 +2,8 @@
 
 RL finetuning for real robot manipulation policies. This system takes a pretrained behavior cloning (BC) policy (diffusion policy) and finetunes it online using reinforcement learning on a real robot.
 
+当前 YAM Hanoi diffusion-policy + HiRE finetuning 的现场部署流程见 [HANOI_FINETUNING.md](HANOI_FINETUNING.md)。
+
 ## Architecture
 
 Two-process architecture communicating via [RobotMQ](https://pypi.org/project/robotmq/) (ZMQ-based):

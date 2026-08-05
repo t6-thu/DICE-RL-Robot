@@ -4,6 +4,8 @@
 # Usage in two terminals:
 #   bash scripts/launch_hanoi_hire.sh learner
 #   bash scripts/launch_hanoi_hire.sh envrunner --residual-scale 0.1
+# Interactive checkpoint evaluation:
+#   bash scripts/launch_hanoi_hire.sh eval --num-episodes 15
 
 set -e
 
@@ -12,7 +14,7 @@ ROLE="${1:-}"
 shift || true
 
 if [ -z "$ROLE" ]; then
-  echo "usage: $0 {learner|envrunner} [envrunner args...]"
+  echo "usage: $0 {learner|envrunner|eval} [args...]"
   exit 1
 fi
 

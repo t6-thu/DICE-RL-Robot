@@ -4,7 +4,7 @@
 Workflow:
     1. Lists every `checkpoint_*.pt` in RL_CKPT_DIR (plus a "BC-only" slot).
     2. You pick one → it's loaded into a fresh DistilledActor.
-    3. Run as many evaluation episodes as you like with that ckpt:
+    3. Run a fixed number of evaluation episodes with that ckpt (15 by default):
          Enter   → start episode
          s/f/d   → label success / failure / discard
        Episodes are saved into:
@@ -21,13 +21,13 @@ Refers to dice_rl/env_runner/yam_rl_env_runner.py for the rollout loop and to
 scripts/view_episode.py for the .npz layout.
 
 Usage:
-    . ./prepare.sh
-    python scripts/eval_ckpt.py                              # interactive picker
-    python scripts/eval_ckpt.py --ckpt checkpoint_006000.pt  # auto-pick one ckpt
-    python scripts/eval_ckpt.py --bc                         # pure BC, no actor
+    bash scripts/launch_hanoi_hire.sh eval
+    bash scripts/launch_hanoi_hire.sh eval --ckpt checkpoint_006000.pt
+    bash scripts/launch_hanoi_hire.sh eval --bc
 """
 from __future__ import annotations
 import argparse
+import atexit
 import glob
 import logging
 import os
@@ -44,6 +44,7 @@ from dice_rl.config.yam_rl_config import (
     BC_POLICY_CKPT, NORM_NPZ, RUN_NAME, ONLINE_DATA_DIR, RL_CKPT_DIR,
     TRAINING, NETWORK, HARDWARE, COMM,
 )
+from dice_rl.config.yam_env_overrides import apply_hardware_env_overrides
 from dice_rl.env_runner.yam_rl_env_runner import YAMRLEnvRunner
 from dice_rl.model.distill_rl import DistilledActor
 
@@ -116,22 +117,54 @@ def main():
     p.add_argument("--max-joint-step", type=float, default=0.04,
                    help="max absolute command change per 30 Hz step; keep this "
                         "conservative for real-robot ckpt eval")
+    p.add_argument("--num-episodes", type=int, default=15,
+                   help="target number of saved s/f episodes per checkpoint; "
+                        "existing eval files count toward the target (0=unlimited)")
+    p.add_argument("--max-episode-steps", type=int, default=None,
+                   help="maximum diffusion-query chunks per episode; default comes "
+                        "from YAM_MAX_EPISODE_STEPS / hardware config")
     args = p.parse_args()
+    if args.num_episodes < 0:
+        p.error("--num-episodes must be >= 0")
+    if args.max_episode_steps is not None and args.max_episode_steps <= 0:
+        p.error("--max-episode-steps must be > 0")
+
+    # Apply the same camera-order, camera-serial, freshness and episode-length
+    # environment overrides used by the training env runner. Hanoi's launcher
+    # sets wrist_base + center_crop and the task-specific model/data paths.
+    hardware = apply_hardware_env_overrides(HARDWARE)
+    max_episode_steps = (
+        args.max_episode_steps
+        if args.max_episode_steps is not None
+        else hardware["max_episode_steps"]
+    )
+
+    log.info(
+        "Eval config: run=%s policy_camera_order=%s preprocess=%s "
+        "max_episode_steps=%d episodes_per_ckpt=%s",
+        RUN_NAME,
+        hardware["policy_camera_order"],
+        os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop"),
+        max_episode_steps,
+        args.num_episodes if args.num_episodes else "unlimited",
+    )
 
     # Build the env runner with NO weights-watch path → it never auto-loads
     # latest_actor.pt under our feet during eval.
-    log.info("Constructing env runner (loading BC, opening cameras, homing) …")
+    log.info("Constructing env runner (loading BC and opening cameras) …")
     runner = YAMRLEnvRunner(
         pretrained_policy_ckpt=BC_POLICY_CKPT,
         norm_npz_path=NORM_NPZ,
-        base_cam_serial=HARDWARE["base_cam_serial"],
-        wrist_cam_serial=HARDWARE["wrist_cam_serial"],
-        can_channel=HARDWARE["can_channel"],
-        gripper_type=HARDWARE["gripper_type"],
-        home_joint_pos=HARDWARE["home_joint_pos"],
-        home_gripper_pos=HARDWARE["home_gripper_pos"],
-        control_hz=HARDWARE["control_hz"],
-        max_episode_steps=HARDWARE["max_episode_steps"],
+        base_cam_serial=hardware["base_cam_serial"],
+        wrist_cam_serial=hardware["wrist_cam_serial"],
+        policy_camera_order=hardware["policy_camera_order"],
+        can_channel=hardware["can_channel"],
+        gripper_type=hardware["gripper_type"],
+        home_joint_pos=hardware["home_joint_pos"],
+        home_gripper_pos=hardware["home_gripper_pos"],
+        control_hz=hardware["control_hz"],
+        max_episode_steps=max_episode_steps,
+        max_camera_age=hardware.get("max_camera_age", 0.5),
         obs_horizon=TRAINING["obs_horizon"],
         action_horizon=TRAINING["action_horizon"],
         action_dim=TRAINING["action_dim"],
@@ -145,6 +178,8 @@ def main():
         transitions_server_endpoint=COMM["transitions_server_endpoint"],
         transitions_topic=COMM["transitions_topic"],
     )
+    atexit.register(runner.close)
+
     runner._move_to_home()
 
     # Track results per ckpt across the session.
@@ -203,6 +238,14 @@ def main():
                     else:                       tally[label]["f"] += 1
                 except Exception: pass
 
+        if args.num_episodes and ep_idx >= args.num_episodes:
+            log.info(
+                "%s already has %d/%d saved eval episodes; choose another checkpoint",
+                label, ep_idx, args.num_episodes,
+            )
+            choice = pick_ckpt_interactive(RL_CKPT_DIR)
+            continue
+
         # Inner episode loop with the chosen ckpt.
         while True:
             actor_info = (f"actor step={runner._actor_step}"
@@ -243,6 +286,7 @@ def main():
                 actions=ep_data["actions"],
                 rewards=ep_data["rewards"],
                 dones=ep_data["dones"],
+                policy_camera_order=np.asarray(runner.policy_camera_order),
             )
             tot = tally[label]["s"] + tally[label]["f"]
             sr  = tally[label]["s"] / max(tot, 1) * 100.0
@@ -250,6 +294,15 @@ def main():
                      os.path.basename(ep_path), ok, tally[label]["s"], tot, sr)
             ep_idx += 1
             runner._move_to_home()
+
+            if args.num_episodes and ep_idx >= args.num_episodes:
+                log.info(
+                    "Completed %d/%d saved eval episodes for %s; "
+                    "returning to checkpoint picker",
+                    ep_idx, args.num_episodes, label,
+                )
+                choice = pick_ckpt_interactive(RL_CKPT_DIR)
+                break
 
     # ---- final summary ----
     print("\n=========== EVAL SUMMARY ===========")
@@ -259,6 +312,7 @@ def main():
         print(f"  {label:30s}  s={t['s']:3d}  f={t['f']:3d}  d={t['d']:3d}  → {sr:5.1f}%")
     print(f"Replay any of them with:")
     print(f"  python scripts/view_episode.py {args.out_root}/<label>/")
+    runner.close()
 
 
 if __name__ == "__main__":
