@@ -102,6 +102,35 @@ def load_actor_from_ckpt(ckpt_path: str, obs_feature_dim: int, device: torch.dev
     return actor
 
 
+def save_episode_atomic(ep_path: str, ep_data: dict, camera_order: str) -> None:
+    """Write one eval episode atomically so ENOSPC never leaves a fake .npz.
+
+    np.savez_compressed writes a ZIP stream incrementally. If the filesystem
+    fills, a direct write leaves a truncated file whose name still matches
+    episode_*.npz and is then incorrectly counted on resume. Write to a
+    non-matching temporary name and publish it only after the ZIP closes.
+    """
+    tmp_path = ep_path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            np.savez_compressed(
+                f,
+                images=(ep_data["images"] * 255.0).clip(0, 255).astype(np.uint8),
+                states=ep_data["states"],
+                actions=ep_data["actions"],
+                rewards=ep_data["rewards"],
+                dones=ep_data["dones"],
+                policy_camera_order=np.asarray(camera_order),
+            )
+        os.replace(tmp_path, ep_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 # ---- main ----
 
 def main():
@@ -279,15 +308,12 @@ def main():
             ok = bool(ep_data["success"])
             tally[label]["s" if ok else "f"] += 1
             ep_path = os.path.join(save_dir, f"episode_{ep_idx:04d}.npz")
-            np.savez_compressed(
-                ep_path,
-                images=(ep_data["images"] * 255.0).clip(0, 255).astype(np.uint8),
-                states=ep_data["states"],
-                actions=ep_data["actions"],
-                rewards=ep_data["rewards"],
-                dones=ep_data["dones"],
-                policy_camera_order=np.asarray(runner.policy_camera_order),
-            )
+            try:
+                save_episode_atomic(ep_path, ep_data, runner.policy_camera_order)
+            except Exception:
+                log.exception("Failed to save %s; closing robot immediately", ep_path)
+                runner.close()
+                raise
             tot = tally[label]["s"] + tally[label]["f"]
             sr  = tally[label]["s"] / max(tot, 1) * 100.0
             log.info("Saved %s  (success=%s)  → %s/%s = %.1f%%",

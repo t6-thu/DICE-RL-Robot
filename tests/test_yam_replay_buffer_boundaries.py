@@ -139,6 +139,26 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
                 states[2, 0],
             )
 
+    def test_expert_image_sidecar_is_preferred(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            expert_path = tmp_path / "expert.npz"
+            self._write_expert(expert_path)
+            sidecar = tmp_path / "expert_images.npy"
+            np.save(sidecar, np.full((5, 6, 2, 2), 123, dtype=np.uint8))
+
+            replay = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(tmp_path / "online"),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                device="cpu",
+            )
+
+            self.assertIsInstance(replay._expert_images, np.memmap)
+            self.assertEqual(int(replay._expert_images[0, 0, 0, 0]), 123)
+
     def test_online_ring_eviction_releases_unreferenced_episode_arrays(self):
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
@@ -172,6 +192,54 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
             self.assertEqual(set(replay._online_episodes), {1})
             self.assertEqual(set(ep_id for ep_id, _ in replay._online), {1})
             self.assertEqual(replay._online_episode_refcounts, {1: 3})
+
+    def test_sparse_online_success_keeps_hire_for_failures(self):
+        """Success is sparse while a failed episode retains HiRE shaping."""
+
+        class FakeHireShaper:
+            @staticmethod
+            def is_ready():
+                return True
+
+            @staticmethod
+            def shape_rewards(rewards, images, horizon):
+                return np.full(len(rewards) - horizon, 7.0, dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            expert_path = tmp_path / "expert.npz"
+            self._write_expert(expert_path)
+            replay = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(tmp_path / "online"),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                device="cpu",
+                hire_shaper=FakeHireShaper(),
+                use_sparse_for_online_success=True,
+            )
+
+            def episode(success):
+                states = np.zeros((3, 7), dtype=np.float32)
+                rewards = np.array([0.0, 0.0, float(success)], dtype=np.float32)
+                return {
+                    "states": states,
+                    "actions": states.copy(),
+                    "images": np.zeros((3, 6, 2, 2), dtype=np.uint8),
+                    "rewards": rewards,
+                    "dones": np.array([False, False, True]),
+                }
+
+            replay.add_episode(episode(success=True))
+            replay._online = type(replay._online)([(0, 0)], maxlen=replay._max_online)
+            success_batch = replay._sample_online(1, torch.device("cpu"))
+            self.assertEqual(success_batch["reward"].item(), 1.0)
+
+            replay.add_episode(episode(success=False))
+            replay._online = type(replay._online)([(1, 0)], maxlen=replay._max_online)
+            failure_batch = replay._sample_online(1, torch.device("cpu"))
+            self.assertEqual(failure_batch["reward"].item(), 7.0)
 
 
 if __name__ == "__main__":

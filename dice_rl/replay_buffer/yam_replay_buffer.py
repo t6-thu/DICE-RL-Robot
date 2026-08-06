@@ -94,8 +94,21 @@ class YAMReplayBuffer:
         d = np.load(expert_npz_path)
         self._expert_states = d["states"].astype(np.float32)   # (T, 7) [-1,1]
         self._expert_actions = d["actions"].astype(np.float32) # (T, 7) [-1,1]
-        self._expert_images = d["images"]                       # (T, 6, H, W) uint8
+        image_sidecar = os.path.splitext(expert_npz_path)[0] + "_images.npy"
+        if os.path.isfile(image_sidecar):
+            self._expert_images = np.load(image_sidecar, mmap_mode="r")
+            log.info(
+                "Replay buffer: using mmap'd expert image sidecar %s",
+                os.path.basename(image_sidecar),
+            )
+        else:
+            self._expert_images = d["images"]                   # (T, 6, H, W) uint8
         self._expert_traj_lengths = d["traj_lengths"].astype(int)
+        if len(self._expert_images) != len(self._expert_states):
+            raise ValueError(
+                "expert image/state length mismatch: "
+                f"images={len(self._expert_images)} states={len(self._expert_states)}"
+            )
         ep_starts = np.concatenate([[0], np.cumsum(self._expert_traj_lengths[:-1])])
         n_eps = int(len(self._expert_traj_lengths))
 

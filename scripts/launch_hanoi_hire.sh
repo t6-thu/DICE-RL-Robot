@@ -35,11 +35,24 @@ export YAM_MAX_EPISODE_STEPS="${YAM_MAX_EPISODE_STEPS:-36}"
 : "${YAM_HIRE_EXPERT_CURATION_PATH:=}"
 export YAM_HIRE_EXPERT_CURATION_PATH
 
-for required in "$YAM_EXPERT_NPZ" "$YAM_NORM_NPZ"; do
+# Eval/envrunner only need the live normalization metadata. The learner also
+# needs the full expert dataset for replay + HiRE seeding. Keeping these checks
+# role-specific lets checkpoint evaluation continue when archived expert images
+# are intentionally kept off the robot workstation.
+required_files=("$YAM_NORM_NPZ")
+if [ "$ROLE" = "learner" ]; then
+  required_files+=("$YAM_EXPERT_NPZ")
+fi
+
+for required in "${required_files[@]}"; do
   if [ ! -f "$required" ]; then
     echo "[hanoi-hire] missing required file: $required"
-    echo "[hanoi-hire] generate data with:"
-    echo "  .venv/bin/python scripts/process_hanoi_hdf5_to_npz.py"
+    if [ "$required" = "$YAM_EXPERT_NPZ" ]; then
+      echo "[hanoi-hire] learner requires the original expert train.npz"
+      echo "[hanoi-hire] restore it from backup or regenerate it from the original HDF5"
+    else
+      echo "[hanoi-hire] restore normalization.npz from the matching Hanoi dataset"
+    fi
     exit 1
   fi
 done
@@ -50,6 +63,7 @@ if [ ! -f "$YAM_BC_POLICY_CKPT" ] && [ ! -f "$YAM_BC_POLICY_CKPT/checkpoints/lat
 fi
 
 echo "[hanoi-hire] reward=$YAM_REWARD_MODE run=$YAM_RUN_NAME"
+echo "[hanoi-hire] sparse_online_success=${YAM_HIRE_SPARSE_ONLINE_SUCCESS:-0}"
 echo "[hanoi-hire] bc=$YAM_BC_POLICY_CKPT"
 echo "[hanoi-hire] expert=$YAM_EXPERT_NPZ"
 echo "[hanoi-hire] norm=$YAM_NORM_NPZ"

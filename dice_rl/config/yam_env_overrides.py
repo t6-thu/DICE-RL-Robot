@@ -91,7 +91,7 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_learner_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
-    """Overlay learner resource knobs from env vars.
+    """Overlay learner resource and reward-recipe knobs from env vars.
 
     These are intentionally separate from reward selection. They let a single
     workstation run Robometer + learner without building a huge pre-encoded
@@ -112,6 +112,15 @@ def apply_learner_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
             if os.environ.get(en) not in (None, ""):
                 out[key] = int(os.environ[en])
                 break
+
+    # HiRE reward recipe: keep dense PBRS for failed online episodes, while
+    # successful online episodes use the same sparse terminal reward as the
+    # offline expert data. This only affects the learner/replay buffer.
+    if os.environ.get("YAM_HIRE_SPARSE_ONLINE_SUCCESS") not in (None, ""):
+        out["use_sparse_for_online_success"] = _bool(
+            "YAM_HIRE_SPARSE_ONLINE_SUCCESS",
+            out.get("use_sparse_for_online_success", False),
+        )
     return out
 
 
