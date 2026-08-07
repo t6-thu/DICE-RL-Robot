@@ -202,7 +202,9 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
                 return True
 
             @staticmethod
-            def shape_rewards(rewards, images, horizon):
+            def shape_rewards(
+                rewards, images, horizon, adaptive_decay_enabled=True
+            ):
                 return np.full(len(rewards) - horizon, 7.0, dtype=np.float32)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -240,6 +242,61 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
             replay._online = type(replay._online)([(1, 0)], maxlen=replay._max_online)
             failure_batch = replay._sample_online(1, torch.device("cpu"))
             self.assertEqual(failure_batch["reward"].item(), 7.0)
+
+    def test_hire_decay_starts_after_warmup_episode_count(self):
+        class TrackingHireShaper:
+            adaptive_success_rate_ema = 0.0
+
+            def __init__(self):
+                self.shape_decay_flags = []
+                self.outcome_decay_flags = []
+
+            @staticmethod
+            def is_ready():
+                return True
+
+            def shape_rewards(
+                self, rewards, images, horizon, adaptive_decay_enabled=True
+            ):
+                self.shape_decay_flags.append(adaptive_decay_enabled)
+                return np.zeros(len(rewards) - horizon, dtype=np.float32)
+
+            @staticmethod
+            def current_adaptive_dense_weight(decay_enabled=True):
+                return 0.025 if decay_enabled else 0.05
+
+            def observe_episode_outcome(self, success, decay_enabled):
+                self.outcome_decay_flags.append(decay_enabled)
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            expert_path = tmp_path / "expert.npz"
+            self._write_expert(expert_path)
+            shaper = TrackingHireShaper()
+            replay = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(tmp_path / "online"),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                device="cpu",
+                hire_shaper=shaper,
+                hire_pbrs_decay_start_episode=2,
+            )
+
+            episode = {
+                "states": np.zeros((3, 7), dtype=np.float32),
+                "actions": np.zeros((3, 7), dtype=np.float32),
+                "images": np.zeros((3, 6, 2, 2), dtype=np.uint8),
+                "rewards": np.zeros(3, dtype=np.float32),
+                "dones": np.array([False, False, True]),
+            }
+            replay.add_episode(episode)
+            replay.add_episode(episode)
+            replay.add_episode(episode)
+
+            self.assertEqual(shaper.shape_decay_flags, [False, False, True])
+            self.assertEqual(shaper.outcome_decay_flags, [False, False, True])
 
 
 if __name__ == "__main__":

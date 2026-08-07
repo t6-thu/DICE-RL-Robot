@@ -70,6 +70,7 @@ class YAMReplayBuffer:
         hire_shaper=None,
         robometer_shaper=None,
         use_sparse_for_online_success: bool = False,
+        hire_pbrs_decay_start_episode: int = 20,
         expert_curation_path: Optional[str] = None,
         expected_policy_camera_order: Optional[str] = None,
     ) -> None:
@@ -87,6 +88,9 @@ class YAMReplayBuffer:
         # episodes always use the shaped reward. Offline expert demos use a
         # sparse +1 only on the terminal transition (matches online success).
         self.use_sparse_for_online_success = bool(use_sparse_for_online_success)
+        self.hire_pbrs_decay_start_episode = int(hire_pbrs_decay_start_episode)
+        if self.hire_pbrs_decay_start_episode < 0:
+            raise ValueError("hire_pbrs_decay_start_episode must be >= 0")
         self.expected_policy_camera_order = expected_policy_camera_order
 
         # ---- expert buffer (preloaded from BC training npz) ----
@@ -255,6 +259,11 @@ class YAMReplayBuffer:
         I = self._compact_images(episode["images"])
         T = len(S)
         H = self.action_horizon
+        success = bool(R_sparse[-1] > 0.5) if len(R_sparse) > 0 else False
+        episode_index = self._num_online_episodes
+        adaptive_decay_enabled = (
+            episode_index >= self.hire_pbrs_decay_start_episode
+        )
 
         if not (len(A) == len(R_sparse) == len(D) == len(I) == T):
             raise ValueError(
@@ -265,10 +274,14 @@ class YAMReplayBuffer:
 
         if T <= H:
             log.debug("Episode too short (%d frames) for even one chunk, skipping", T)
+            if self.hire_shaper is not None and hasattr(
+                self.hire_shaper, "observe_episode_outcome"
+            ):
+                self.hire_shaper.observe_episode_outcome(
+                    success, decay_enabled=adaptive_decay_enabled
+                )
             self._num_online_episodes += 1
             return
-
-        success = bool(R_sparse[-1] > 0.5) if len(R_sparse) > 0 else False
 
         # HiRE PBRS shaping with H-step lookahead:
         #   r̃_t = R_sparse[t+H] + γ·Φ(s_{t+H}) − Φ(s_t)
@@ -278,7 +291,12 @@ class YAMReplayBuffer:
             # robometer RLPD online rollouts.
             R_shaped_tr = self.robometer_shaper.shape_rewards(I, horizon=H)
         elif self.hire_shaper is not None and self.hire_shaper.is_ready():
-            R_shaped_tr = self.hire_shaper.shape_rewards(R_sparse, I, horizon=H)
+            R_shaped_tr = self.hire_shaper.shape_rewards(
+                R_sparse,
+                I,
+                horizon=H,
+                adaptive_decay_enabled=adaptive_decay_enabled,
+            )
         else:
             # Fallback: use sparse reward at t+H with no shaping.
             R_shaped_tr = np.array(
@@ -306,6 +324,27 @@ class YAMReplayBuffer:
             self._append_online_ref(episode_id, t)
 
         self._num_online_episodes += 1
+        if self.hire_shaper is not None and hasattr(
+            self.hire_shaper, "observe_episode_outcome"
+        ):
+            weight_used = self.hire_shaper.current_adaptive_dense_weight(
+                decay_enabled=adaptive_decay_enabled
+            )
+            self.hire_shaper.observe_episode_outcome(
+                success, decay_enabled=adaptive_decay_enabled
+            )
+            log.info(
+                "HiRE PBRS schedule: episode=%d decay=%s outcome=%s "
+                "weight_used=%.6f success_ema_after=%.6f next_weight=%.6f",
+                episode_index + 1,
+                "on" if adaptive_decay_enabled else "off(warmup)",
+                "success" if success else "failure",
+                weight_used,
+                self.hire_shaper.adaptive_success_rate_ema,
+                self.hire_shaper.current_adaptive_dense_weight(
+                    decay_enabled=adaptive_decay_enabled
+                ),
+            )
         log.debug("Online buffer: %d transitions from %d episodes",
                   len(self._online), self._num_online_episodes)
 

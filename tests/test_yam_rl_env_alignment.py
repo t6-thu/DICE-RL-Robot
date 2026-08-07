@@ -96,3 +96,41 @@ def test_hire_tracks_policy_keys_without_relabeling_physical_cameras():
         shaper.pos_buffer_online["rgb_0"],
         shaper.pos_buffer_online["rgb_1"],
     )
+
+
+def test_hire_success_rate_decay_matches_reference_formula():
+    class FakeEncoder:
+        device = torch.device("cpu")
+
+    shaper = HireRewardShaper(
+        encoder=FakeEncoder(),
+        gamma_pbrs=1.0,
+        adaptive_dense_weight_max=0.05,
+        adaptive_dense_weight_min=0.0,
+        adaptive_dense_weight_alpha=1.0,
+        adaptive_success_rate_ema_decay=0.95,
+    )
+    shaper.is_ready = lambda: True
+    shaper._compute_potential = lambda images: np.array(
+        [1.0, 2.0, 3.0], dtype=np.float32
+    )
+    sparse = np.zeros(3, dtype=np.float32)
+    images = np.zeros((3, 6, 2, 2), dtype=np.uint8)
+
+    # Warmup: fixed maximum weight; success does not update the EMA.
+    warmup = shaper.shape_rewards(
+        sparse, images, horizon=1, adaptive_decay_enabled=False
+    )
+    np.testing.assert_allclose(warmup, [0.05, -0.10], atol=1e-7)
+    shaper.observe_episode_outcome(success=True, decay_enabled=False)
+    assert shaper.adaptive_success_rate_ema == 0.0
+
+    # First post-warmup success updates EMA to 0.05, so the next episode uses
+    # 0.05 * (1 - 0.05) = 0.0475.
+    shaper.observe_episode_outcome(success=True, decay_enabled=True)
+    assert abs(shaper.adaptive_success_rate_ema - 0.05) < 1e-9
+    assert abs(shaper.current_adaptive_dense_weight(True) - 0.0475) < 1e-9
+    decayed = shaper.shape_rewards(
+        sparse, images, horizon=1, adaptive_decay_enabled=True
+    )
+    np.testing.assert_allclose(decayed, [0.0475, -0.095], atol=1e-7)

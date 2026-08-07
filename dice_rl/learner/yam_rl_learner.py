@@ -130,6 +130,12 @@ class YAMRLLearner:
         #   False (default) — online success uses HiRE shaped reward (full method)
         #   True            — online success reverts to sparse reward (offline-style)
         use_sparse_for_online_success: bool = False,
+        hire_pbrs_decay_start_episode: int = 20,
+        hire_adaptive_dense_weight_max: float = 0.05,
+        hire_adaptive_dense_weight_min: float = 0.0,
+        hire_adaptive_dense_weight_alpha: float = 1.0,
+        hire_adaptive_success_rate_ema_decay: float = 0.95,
+        hire_adaptive_success_rate_norm_cap: float = 1.0,
         # ZMQ
         network_server_endpoint: str = "ipc:///tmp/feeds/rl_weights",
         network_weight_topic: str = "rl_network_weights_topic",
@@ -279,6 +285,11 @@ class YAMRLLearner:
                 max_pos_buffer_size=hire_max_pos_buffer_size,
                 max_neg_buffer_size=hire_max_neg_buffer_size,
                 online_pos_ratio=hire_online_pos_ratio,
+                adaptive_dense_weight_max=hire_adaptive_dense_weight_max,
+                adaptive_dense_weight_min=hire_adaptive_dense_weight_min,
+                adaptive_dense_weight_alpha=hire_adaptive_dense_weight_alpha,
+                adaptive_success_rate_ema_decay=hire_adaptive_success_rate_ema_decay,
+                adaptive_success_rate_norm_cap=hire_adaptive_success_rate_norm_cap,
             )
             # 1) Positive buffer ← ALL (strided) frames of offline expert demos.
             #    This is the only seeding HiRE always does — it gives the
@@ -315,6 +326,7 @@ class YAMRLLearner:
             hire_shaper=self.hire_shaper,
             robometer_shaper=self.robometer_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
+            hire_pbrs_decay_start_episode=hire_pbrs_decay_start_episode,
             # Missing/None curation means all expert trajectories, matching DP.
             expert_curation_path=hire_expert_curation_path,
             expected_policy_camera_order=expected_policy_camera_order,
@@ -378,6 +390,24 @@ class YAMRLLearner:
         log.info("  bc_pool_inference_steps            = %d", self.bc_pool_inference_steps)
         log.info("  starting at total_episodes=%d, total_gradient_steps=%d",
                  self.total_episodes, self.total_gradient_steps)
+        if self.hire_shaper is not None:
+            log.info(
+                "  HiRE PBRS success decay: start_episode=%d "
+                "weight_max=%.4f weight_min=%.4f alpha=%.2f "
+                "ema_decay=%.3f current_ema=%.4f current_weight=%.6f",
+                self.replay_buffer.hire_pbrs_decay_start_episode,
+                self.hire_shaper.adaptive_dense_weight_max,
+                self.hire_shaper.adaptive_dense_weight_min,
+                self.hire_shaper.adaptive_dense_weight_alpha,
+                self.hire_shaper.adaptive_success_rate_ema_decay,
+                self.hire_shaper.adaptive_success_rate_ema,
+                self.hire_shaper.current_adaptive_dense_weight(
+                    decay_enabled=(
+                        self.total_episodes
+                        >= self.replay_buffer.hire_pbrs_decay_start_episode
+                    )
+                ),
+            )
 
         while True:
             new_count = self._scan_new_disk_episodes()

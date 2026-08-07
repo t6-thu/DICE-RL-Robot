@@ -272,6 +272,19 @@ TRAINING = dict(
     # domain gap with online frames). 0.0 = original behavior (expert only).
     hire_online_pos_ratio          = 1.0,
 
+    # HiRE-Dice_RL success-rate-driven PBRS schedule:
+    #   w = max * (1 - success_rate_ema)^alpha + min
+    # Episodes 1..20 are the pure-BC warmup pool: use fixed max weight and do
+    # not update the EMA. Post-warmup episodes 21..30 use the adaptive weight,
+    # so the second training round at episode 30 is the first round containing
+    # success-rate-decayed PBRS transitions.
+    hire_pbrs_decay_start_episode          = 20,
+    hire_adaptive_dense_weight_max         = 0.05,
+    hire_adaptive_dense_weight_min         = 0.0,
+    hire_adaptive_dense_weight_alpha       = 1.0,
+    hire_adaptive_success_rate_ema_decay   = 0.95,
+    hire_adaptive_success_rate_norm_cap    = 1.0,
+
     # Reward-recipe switch:
     #   False (default) → online success uses HiRE-shaped reward (full method)
     #   True            → online success reverts to sparse reward, like offline

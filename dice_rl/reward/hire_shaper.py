@@ -4,7 +4,8 @@ Ports the contrastive-prompt PBRS recipe from the simulation codebase
 `dice-rl` (commit `nhy_fixedbuffer`):
 
     Φ(s) = reward_weight · ( sim_pos(s) − contrastive_lambda · sim_neg(s) )
-    r_dense_t = γ_pbrs · Φ(s_{t+1}) − Φ(s_t)            (standard PBRS)
+    w(sr) = w_max · (1 − success_rate_ema)^alpha + w_min
+    r_dense_t = w(sr) · (γ_pbrs · Φ(s_{t+1}) − Φ(s_t))
     r_final   = r_sparse + r_dense
 
 `sim_X(s)` is a logsumexp-smooth-max over `K` cosine-similarities between
@@ -143,6 +144,12 @@ class HireRewardShaper:
         # If one pool is empty, all K samples come from the other.
         online_pos_ratio: float = 1.0,
         encode_batch_size: int = 32,
+        # Success-rate-driven PBRS decay, matching HiRE-Dice_RL.
+        adaptive_dense_weight_max: float = 0.05,
+        adaptive_dense_weight_min: float = 0.0,
+        adaptive_dense_weight_alpha: float = 1.0,
+        adaptive_success_rate_ema_decay: float = 0.95,
+        adaptive_success_rate_norm_cap: float = 1.0,
     ) -> None:
         self.encoder = encoder
         self.device  = encoder.device
@@ -160,6 +167,26 @@ class HireRewardShaper:
         self.max_neg_buffer_size   = int(max_neg_buffer_size)
         self.online_pos_ratio      = max(0.0, min(1.0, float(online_pos_ratio)))
         self.encode_batch_size     = int(encode_batch_size)
+        self.adaptive_dense_weight_max = float(adaptive_dense_weight_max)
+        self.adaptive_dense_weight_min = float(adaptive_dense_weight_min)
+        self.adaptive_dense_weight_alpha = float(adaptive_dense_weight_alpha)
+        self.adaptive_success_rate_ema_decay = float(
+            adaptive_success_rate_ema_decay
+        )
+        self.adaptive_success_rate_norm_cap = float(
+            adaptive_success_rate_norm_cap
+        )
+        if self.adaptive_dense_weight_max < 0.0:
+            raise ValueError("adaptive_dense_weight_max must be >= 0")
+        if self.adaptive_dense_weight_min < 0.0:
+            raise ValueError("adaptive_dense_weight_min must be >= 0")
+        if self.adaptive_dense_weight_alpha <= 0.0:
+            raise ValueError("adaptive_dense_weight_alpha must be > 0")
+        if not 0.0 <= self.adaptive_success_rate_ema_decay < 1.0:
+            raise ValueError("adaptive_success_rate_ema_decay must be in [0, 1)")
+        if self.adaptive_success_rate_norm_cap <= 0.0:
+            raise ValueError("adaptive_success_rate_norm_cap must be > 0")
+        self.adaptive_success_rate_ema = 0.0
 
         # Per-camera FIFO buffers.
         # SPLIT positive buffer: expert vs online-success kept separate so that
@@ -183,6 +210,38 @@ class HireRewardShaper:
                 if t is not None and t.numel() > 0:
                     return True
         return False
+
+    # ------------------------------------------------------------------
+    # Success-rate-driven PBRS weight
+    # ------------------------------------------------------------------
+
+    def current_adaptive_dense_weight(self, decay_enabled: bool = True) -> float:
+        """Return the PBRS multiplier for the next episode.
+
+        Before the post-warmup schedule is enabled, use the configured maximum
+        without updating or consulting the success EMA. Once enabled, match
+        HiRE-Dice_RL's ``max * (1 - sr_ema)^alpha + min`` schedule.
+        """
+        if not decay_enabled:
+            return self.adaptive_dense_weight_max + self.adaptive_dense_weight_min
+        sr = max(0.0, min(1.0, float(self.adaptive_success_rate_ema)))
+        return (
+            self.adaptive_dense_weight_max
+            * ((1.0 - sr) ** self.adaptive_dense_weight_alpha)
+            + self.adaptive_dense_weight_min
+        )
+
+    def observe_episode_outcome(self, success: bool, decay_enabled: bool) -> None:
+        """Update success EMA after an episode whose reward has been shaped."""
+        if not decay_enabled:
+            return
+        cap = self.adaptive_success_rate_norm_cap
+        success_value = min(1.0, max(0.0, float(bool(success)) / cap))
+        decay = self.adaptive_success_rate_ema_decay
+        self.adaptive_success_rate_ema = (
+            decay * self.adaptive_success_rate_ema
+            + (1.0 - decay) * success_value
+        )
 
     def _pos_buffer_for_sampling(self, cam: str) -> Optional[torch.Tensor]:
         """Sample-time positive pool for one camera, respecting online_pos_ratio.
@@ -495,11 +554,13 @@ class HireRewardShaper:
     @torch.no_grad()
     def shape_rewards(self, sparse_rewards: np.ndarray,
                       images_T6HW_f01: np.ndarray,
-                      horizon: int = 1) -> np.ndarray:
+                      horizon: int = 1,
+                      adaptive_decay_enabled: bool = True) -> np.ndarray:
         """Return per-transition shaped rewards of length T-horizon.
 
         For transition t with next_obs at t+horizon:
-            r̃_t = R_sparse[t+horizon] + γ·Φ(s_{t+horizon}) − Φ(s_t)
+            r̃_t = R_sparse[t+horizon] + w(sr) ·
+                   (γ·Φ(s_{t+horizon}) − Φ(s_t))
 
         horizon=1  : single-step transitions (original behaviour)
         horizon=H  : chunk-level transitions where next_obs is one full
@@ -520,9 +581,12 @@ class HireRewardShaper:
             return sparse[horizon:T].copy()
 
         phi = self._compute_potential(images_T6HW_f01)             # (T,)
+        dense_weight = self.current_adaptive_dense_weight(
+            decay_enabled=adaptive_decay_enabled
+        )
         out = np.empty(n, dtype=np.float32)
         for t in range(n):
             phi_next = 0.0 if t == n - 1 else phi[t + horizon]    # Φ(terminal) = 0
             r_dense = self.gamma_pbrs * phi_next - phi[t]
-            out[t] = sparse[t + horizon] + r_dense
+            out[t] = sparse[t + horizon] + dense_weight * r_dense
         return out
