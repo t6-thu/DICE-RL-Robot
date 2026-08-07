@@ -279,7 +279,7 @@ TRAINING = dict(
     # so the second training round at episode 30 is the first round containing
     # success-rate-decayed PBRS transitions.
     hire_pbrs_decay_start_episode          = 20,
-    hire_adaptive_dense_weight_max         = 0.05,
+    hire_adaptive_dense_weight_max         = 1.0,
     hire_adaptive_dense_weight_min         = 0.0,
     hire_adaptive_dense_weight_alpha       = 1.0,
     hire_adaptive_success_rate_ema_decay   = 0.95,

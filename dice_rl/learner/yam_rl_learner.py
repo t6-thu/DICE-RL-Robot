@@ -131,7 +131,7 @@ class YAMRLLearner:
         #   True            — online success reverts to sparse reward (offline-style)
         use_sparse_for_online_success: bool = False,
         hire_pbrs_decay_start_episode: int = 20,
-        hire_adaptive_dense_weight_max: float = 0.05,
+        hire_adaptive_dense_weight_max: float = 1.0,
         hire_adaptive_dense_weight_min: float = 0.0,
         hire_adaptive_dense_weight_alpha: float = 1.0,
         hire_adaptive_success_rate_ema_decay: float = 0.95,

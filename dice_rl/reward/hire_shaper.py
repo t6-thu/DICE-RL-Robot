@@ -145,7 +145,7 @@ class HireRewardShaper:
         online_pos_ratio: float = 1.0,
         encode_batch_size: int = 32,
         # Success-rate-driven PBRS decay, matching HiRE-Dice_RL.
-        adaptive_dense_weight_max: float = 0.05,
+        adaptive_dense_weight_max: float = 1.0,
         adaptive_dense_weight_min: float = 0.0,
         adaptive_dense_weight_alpha: float = 1.0,
         adaptive_success_rate_ema_decay: float = 0.95,

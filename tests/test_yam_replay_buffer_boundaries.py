@@ -263,7 +263,7 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
 
             @staticmethod
             def current_adaptive_dense_weight(decay_enabled=True):
-                return 0.025 if decay_enabled else 0.05
+                return 0.5 if decay_enabled else 1.0
 
             def observe_episode_outcome(self, success, decay_enabled):
                 self.outcome_decay_flags.append(decay_enabled)
