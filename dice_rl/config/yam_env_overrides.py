@@ -121,6 +121,20 @@ def apply_learner_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
             "YAM_HIRE_SPARSE_ONLINE_SUCCESS",
             out.get("use_sparse_for_online_success", False),
         )
+
+    # Optional fixed HiRE PBRS weight.  HiRE's schedule is
+    # ``max * (1 - success_ema) ** alpha + min`` (the names are not interpolation
+    # bounds), so fixed w requires max=w, min=0, and disabling the decay phase.
+    if os.environ.get("YAM_HIRE_FIXED_DENSE_WEIGHT") not in (None, ""):
+        fixed_weight = _float(
+            "YAM_HIRE_FIXED_DENSE_WEIGHT",
+            out.get("hire_adaptive_dense_weight_max", 1.0),
+        )
+        out["hire_adaptive_dense_weight_max"] = fixed_weight
+        out["hire_adaptive_dense_weight_min"] = 0.0
+        # No real rollout can reach this index; keeping decay disabled also
+        # prevents the success EMA from changing behind a nominally fixed w.
+        out["hire_pbrs_decay_start_episode"] = 2_147_483_647
     return out
 
 
