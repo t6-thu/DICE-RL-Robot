@@ -47,11 +47,17 @@ case "$ROLE" in
     ;;
 
   learner)
-    echo "[isolated] learner → cores $HEAVY_CORES, nice +5, 8 threads"
     cd "$HERE"
     source ./prepare.sh
     RUN_NAME="$(python -c 'from dice_rl.config.yam_rl_config import RUN_NAME; print(RUN_NAME)')"
     RUN_DIR="$HOME/training_outputs/yam_rl_finetuning_${RUN_NAME}"
+    existing_learner="$(pgrep -f '^python scripts/yam_rl_run_learner.py$' | head -n 1 || true)"
+    if [ -n "$existing_learner" ]; then
+      echo "[isolated] learner is already running (PID $existing_learner); refusing to start a duplicate"
+      echo "[isolated] monitor it with: tail -f $RUN_DIR/learner.log"
+      exit 1
+    fi
+    echo "[isolated] learner → cores $HEAVY_CORES, nice +5, 8 threads"
     mkdir -p "$RUN_DIR"
     exec env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 \
       MALLOC_ARENA_MAX=2 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

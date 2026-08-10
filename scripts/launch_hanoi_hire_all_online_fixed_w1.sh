@@ -21,6 +21,10 @@ export YAM_HIRE_FIXED_DENSE_WEIGHT="1.0"
 # Match the deployed BC checkpoint, whose DDIM inference setting is 16.  The
 # learner otherwise defaults to an 8-step shortcut while building its pool.
 export YAM_LEARNER_BC_POOL_INFERENCE_STEPS="16"
+# Keep 16-step diffusion pool construction within GPU headroom when the robot
+# runner and other vision services share the device.  This only chunks pool
+# pre-encoding; the 10k pool, batch_size=256, and optimizer updates are unchanged.
+export YAM_LEARNER_ENCODE_BATCH_SIZE="${YAM_LEARNER_ENCODE_BATCH_SIZE:-32}"
 
-echo "[hanoi-hire-fixed-w1] online_success=hire online_failure=hire fixed_dense_weight=1.0 bc_inference_steps=16 run=$YAM_HANOI_RUN_NAME"
+echo "[hanoi-hire-fixed-w1] online_success=hire online_failure=hire fixed_dense_weight=1.0 bc_inference_steps=16 encode_batch_size=$YAM_LEARNER_ENCODE_BATCH_SIZE run=$YAM_HANOI_RUN_NAME"
 exec bash "$HERE/scripts/launch_hanoi_hire.sh" "$@"

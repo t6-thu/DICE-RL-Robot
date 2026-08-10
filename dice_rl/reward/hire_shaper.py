@@ -166,7 +166,7 @@ class HireRewardShaper:
         self.max_pos_buffer_size   = int(max_pos_buffer_size)
         self.max_neg_buffer_size   = int(max_neg_buffer_size)
         self.online_pos_ratio      = max(0.0, min(1.0, float(online_pos_ratio)))
-        self.encode_batch_size     = int(encode_batch_size)
+        self.encode_batch_size     = max(1, int(encode_batch_size))
         self.adaptive_dense_weight_max = float(adaptive_dense_weight_max)
         self.adaptive_dense_weight_min = float(adaptive_dense_weight_min)
         self.adaptive_dense_weight_alpha = float(adaptive_dense_weight_alpha)
@@ -519,13 +519,6 @@ class HireRewardShaper:
         T = int(images_T6HW_f01.shape[0])
         if T == 0:
             return np.zeros(0, dtype=np.float32)
-        imgs = torch.from_numpy(_as_float01_images(images_T6HW_f01))
-        rgb0 = imgs[:, :3]
-        rgb1 = imgs[:, 3:]
-        f_rgb0 = self.encoder.encode(rgb0)
-        f_rgb1 = self.encoder.encode(rgb1)
-
-        sim_total = torch.zeros(T, device=self.device)
         # Re-sample K from each buffer once per episode (paper does so per step
         # but per-episode sampling is much faster and statistically similar).
         # Positives are drawn ratio-wise from online-success vs offline-expert
@@ -535,17 +528,47 @@ class HireRewardShaper:
         pos_1 = self._pos_buffer_for_sampling("rgb_1")
         neg_1 = self._sample_buffer(self.neg_buffer.get("rgb_1"))
 
-        if "rgb_0" in self.cameras:
-            sp = self._sim_to_targets(f_rgb0, pos_0, beta=self.logsumexp_beta_pos)
-            sn = self._sim_to_targets(f_rgb0, neg_0, beta=self.logsumexp_beta_neg)
-            sim_total = sim_total + (sp - self.contrastive_lambda * sn)
-        if "rgb_1" in self.cameras:
-            sp = self._sim_to_targets(f_rgb1, pos_1, beta=self.logsumexp_beta_pos)
-            sn = self._sim_to_targets(f_rgb1, neg_1, beta=self.logsumexp_beta_neg)
-            sim_total = sim_total + (sp - self.contrastive_lambda * sn)
+        # Encode and score a bounded number of frames at a time.  Keeping both
+        # cameras' full-episode patch tensors alive can require >1 GiB for a
+        # long real-robot rollout and OOM when the BC learner shares the GPU.
+        # Targets are sampled once above, so batching does not change the HiRE
+        # reward definition or introduce per-batch sampling differences.
+        phi_chunks = []
+        bs = self.encode_batch_size
+        for start in range(0, T, bs):
+            stop = min(start + bs, T)
+            imgs = torch.from_numpy(
+                _as_float01_images(images_T6HW_f01[start:stop])
+            )
+            sim_total = torch.zeros(stop - start, device=self.device)
 
-        phi = self.reward_weight * sim_total
-        return phi.detach().cpu().numpy().astype(np.float32)
+            if "rgb_0" in self.cameras:
+                f_rgb0 = self.encoder.encode(imgs[:, :3])
+                sp = self._sim_to_targets(
+                    f_rgb0, pos_0, beta=self.logsumexp_beta_pos
+                )
+                sn = self._sim_to_targets(
+                    f_rgb0, neg_0, beta=self.logsumexp_beta_neg
+                )
+                sim_total.add_(sp - self.contrastive_lambda * sn)
+                del f_rgb0, sp, sn
+
+            if "rgb_1" in self.cameras:
+                f_rgb1 = self.encoder.encode(imgs[:, 3:])
+                sp = self._sim_to_targets(
+                    f_rgb1, pos_1, beta=self.logsumexp_beta_pos
+                )
+                sn = self._sim_to_targets(
+                    f_rgb1, neg_1, beta=self.logsumexp_beta_neg
+                )
+                sim_total.add_(sp - self.contrastive_lambda * sn)
+                del f_rgb1, sp, sn
+
+            phi_chunks.append(
+                (self.reward_weight * sim_total).cpu().numpy().astype(np.float32)
+            )
+
+        return np.concatenate(phi_chunks)
 
     # ------------------------------------------------------------------
     # Public: shape an episode's rewards (PBRS)
