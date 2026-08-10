@@ -181,6 +181,7 @@ class YAMRLEnvRunner:
         actor_hidden_dims: list = None,
         residual_scale: float = 1.0,  # scale on actor's delta — set <1 to soften RL effect
         max_joint_step: float = 0.08,
+        raw_policy: bool = False,
         # Data & ZMQ
         online_data_dir: str = "/tmp/yam_rl_rollouts",
         rl_checkpoint_dir: str = None,
@@ -208,8 +209,9 @@ class YAMRLEnvRunner:
         self.home_joint_pos = np.array(home_joint_pos or [-0.01,0.833,0.903,-0.598,-0.028,-0.029],
                                        dtype=np.float32)
         self.home_gripper_pos = home_gripper_pos
-        self.residual_scale = float(residual_scale)
-        self.max_joint_step = float(max_joint_step)
+        self.raw_policy = bool(raw_policy)
+        self.residual_scale = None if self.raw_policy else float(residual_scale)
+        self.max_joint_step = 0.0 if self.raw_policy else float(max_joint_step)
         self._last_delta_rms = 0.0
         self.online_data_dir = online_data_dir
         self.rl_checkpoint_dir = rl_checkpoint_dir
@@ -218,11 +220,19 @@ class YAMRLEnvRunner:
         )
         self._last_weights_mtime = 0.0
         os.makedirs(online_data_dir, exist_ok=True)
-        log.info(
-            "Env runner control: control_hz=%.1f residual_scale=%.3f "
-            "max_joint_step=%.3f max_episode_steps=%d action_horizon=%d",
-            self.control_hz, self.residual_scale, self.max_joint_step,
-            self.max_episode_steps, self.action_horizon)
+        if self.raw_policy:
+            log.info(
+                "Env runner control: control_hz=%.1f policy_mode=raw "
+                "residual_scale=off max_joint_step=off "
+                "max_episode_steps=%d action_horizon=%d",
+                self.control_hz, self.max_episode_steps, self.action_horizon,
+            )
+        else:
+            log.info(
+                "Env runner control: control_hz=%.1f residual_scale=%.3f "
+                "max_joint_step=%.3f max_episode_steps=%d action_horizon=%d",
+                self.control_hz, self.residual_scale, self.max_joint_step,
+                self.max_episode_steps, self.action_horizon)
         log.info(
             "Image preprocessing: %s",
             os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop").strip().lower(),
@@ -376,7 +386,9 @@ class YAMRLEnvRunner:
         )["sparse"]  # (1, H, 7) normalized
 
         if self.actor is not None:
-            delta = self.actor(features.unsqueeze(1), noise) * self.residual_scale
+            delta = self.actor(features.unsqueeze(1), noise)
+            if not self.raw_policy:
+                delta = delta * self.residual_scale
             final_n = (bc_act_n + delta)
             self._last_delta_rms = float(delta.pow(2).mean().sqrt().item())
         else:

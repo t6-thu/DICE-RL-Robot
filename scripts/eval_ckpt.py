@@ -146,6 +146,9 @@ def main():
     p.add_argument("--max-joint-step", type=float, default=0.04,
                    help="max absolute command change per 30 Hz step; keep this "
                         "conservative for real-robot ckpt eval")
+    p.add_argument("--raw-policy", action="store_true",
+                   help="deploy raw BC+actor output: no residual scaling and no "
+                        "per-step joint slew limit (absolute hardware limits remain)")
     p.add_argument("--num-episodes", type=int, default=15,
                    help="target number of saved s/f episodes per checkpoint; "
                         "existing eval files count toward the target (0=unlimited)")
@@ -170,12 +173,13 @@ def main():
 
     log.info(
         "Eval config: run=%s policy_camera_order=%s preprocess=%s "
-        "max_episode_steps=%d episodes_per_ckpt=%s",
+        "max_episode_steps=%d episodes_per_ckpt=%s raw_policy=%s",
         RUN_NAME,
         hardware["policy_camera_order"],
         os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop"),
         max_episode_steps,
         args.num_episodes if args.num_episodes else "unlimited",
+        args.raw_policy,
     )
 
     # Build the env runner with NO weights-watch path → it never auto-loads
@@ -200,6 +204,7 @@ def main():
         actor_hidden_dims=NETWORK["actor_hidden_dims"],
         residual_scale=args.residual_scale,
         max_joint_step=args.max_joint_step,
+        raw_policy=args.raw_policy,
         online_data_dir="/tmp/_eval_dummy_unused",   # we override save dir ourselves
         rl_checkpoint_dir=None,                       # disables auto-update from latest_actor.pt
         network_server_endpoint=COMM["network_server_endpoint"],

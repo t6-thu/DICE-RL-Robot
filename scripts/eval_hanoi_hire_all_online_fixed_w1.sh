@@ -25,11 +25,10 @@ fi
 
 eval_run="${YAM_HANOI_FIXED_W1_RUN_NAME:-hanoi_hire_all_online_fixed_w1_recovered_success_v3}"
 echo "[hanoi-eval-fixed-w1] run=$eval_run"
-echo "[hanoi-eval-fixed-w1] protocol: 15 saved episodes/checkpoint, 60 chunks/episode, residual=1.0, max_joint_step=0.04"
+echo "[hanoi-eval-fixed-w1] protocol: raw BC+actor policy, 15 saved episodes/checkpoint, 60 chunks/episode"
 
 exec bash "$HERE/scripts/launch_hanoi_hire_all_online_fixed_w1.sh" eval \
   --num-episodes 15 \
   --max-episode-steps 60 \
-  --residual-scale 1.0 \
-  --max-joint-step 0.04 \
+  --raw-policy \
   "$@"
