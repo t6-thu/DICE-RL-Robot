@@ -113,6 +113,7 @@ class YAMRLLearner:
         robometer_max_batch_size: int = 4,
         hire_init_dir: str = None,                # past online episodes to seed pos/neg
         hire_expert_curation_path: str = None,    # JSON listing which expert eps to include
+        replay_expert_curation_path: str = None,  # optional, independent offline replay curation
         hire_reward_weight: float = 1.0,
         hire_contrastive_lambda: float = 0.1,
         hire_logsumexp_beta_pos: float = 10.0,    # sharp max for positive (goal-like)
@@ -323,9 +324,8 @@ class YAMRLLearner:
                      self.use_sparse_for_online_success)
 
         # ---- replay buffer ----
-        # The same curation JSON (consumed by HiRE) is also used here so the
-        # offline expert training set is restricted to the curator-approved
-        # trajectories.  Pass None / missing-file to use ALL expert episodes.
+        # Keep offline replay curation independent from HiRE's visual-positive
+        # curation. Pass None / missing-file to use all expert trajectories.
         self.replay_buffer = YAMReplayBuffer(
             expert_npz_path=expert_npz_path,
             online_data_dir=online_data_dir,
@@ -337,8 +337,7 @@ class YAMRLLearner:
             robometer_shaper=self.robometer_shaper,
             use_sparse_for_online_success=self.use_sparse_for_online_success,
             hire_pbrs_decay_start_episode=hire_pbrs_decay_start_episode,
-            # Missing/None curation means all expert trajectories, matching DP.
-            expert_curation_path=hire_expert_curation_path,
+            expert_curation_path=replay_expert_curation_path,
             expected_policy_camera_order=expected_policy_camera_order,
         )
         if expected_policy_camera_order:

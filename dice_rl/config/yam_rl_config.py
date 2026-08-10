@@ -155,6 +155,14 @@ HIRE_EXPERT_CURATION_PATH = _env_optional_path(
     os.path.join(os.path.dirname(EXPERT_NPZ), "expert_curation.json"),
 )
 
+# Optional, independent curation for the offline expert *replay* samples.
+# Keep this separate from HIRE_EXPERT_CURATION_PATH: the latter selects visual
+# reference frames for the HiRE positive buffer and need not restrict BC/RLPD
+# expert transitions used by the learner.
+REPLAY_EXPERT_CURATION_PATH = _env_optional_path(
+    "YAM_REPLAY_EXPERT_CURATION_PATH", None,
+)
+
 # ============================================================
 # Training algorithm settings
 # ============================================================
@@ -263,7 +271,7 @@ TRAINING = dict(
     #     get appended over time and gradually push out older expert frames.
     #   neg_buffer (cap=10): only the most-recent online failure end-frames —
     #     small on purpose so the policy adapts to its current failure modes.
-    hire_max_pos_buffer_size       = 4096,
+    hire_max_pos_buffer_size       = 8192,
     hire_max_neg_buffer_size       = 320,    # 15 frames × 20 recent failures = 300; gives a meaningful
                                               # window of "current failure modes" without being too stale
     # NEW: mix between online-success and offline-expert as the positive source
@@ -279,7 +287,7 @@ TRAINING = dict(
     # so the second training round at episode 30 is the first round containing
     # success-rate-decayed PBRS transitions.
     hire_pbrs_decay_start_episode          = 20,
-    hire_adaptive_dense_weight_max         = 1.0,
+    hire_adaptive_dense_weight_max         = 0.05,
     hire_adaptive_dense_weight_min         = 0.0,
     hire_adaptive_dense_weight_alpha       = 1.0,
     hire_adaptive_success_rate_ema_decay   = 0.95,

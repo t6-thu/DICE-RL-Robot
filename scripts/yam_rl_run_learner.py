@@ -20,7 +20,7 @@ from dice_rl.config.yam_env_overrides import (
 )
 from dice_rl.config.yam_rl_config import (
     BC_POLICY_CKPT, EXPERT_NPZ, ONLINE_DATA_DIR, NORM_NPZ, RL_CKPT_DIR,
-    HIRE_INIT_DIR, HIRE_EXPERT_CURATION_PATH,
+    HIRE_INIT_DIR, HIRE_EXPERT_CURATION_PATH, REPLAY_EXPERT_CURATION_PATH,
     TRAINING, NETWORK, COMM,
 )
 from dice_rl.learner.yam_rl_learner import YAMRLLearner
@@ -56,6 +56,9 @@ learner = YAMRLLearner(
     rl_checkpoint_dir         = getattr(cfg, "RL_CKPT_DIR", RL_CKPT_DIR),
     hire_init_dir             = getattr(cfg, "HIRE_INIT_DIR", HIRE_INIT_DIR),
     hire_expert_curation_path = getattr(cfg, "HIRE_EXPERT_CURATION_PATH", HIRE_EXPERT_CURATION_PATH),
+    replay_expert_curation_path = getattr(
+        cfg, "REPLAY_EXPERT_CURATION_PATH", REPLAY_EXPERT_CURATION_PATH
+    ),
     expected_policy_camera_order = os.environ.get("YAM_POLICY_CAMERA_ORDER") or None,
     **{**_training, **NETWORK, **COMM},
 )
