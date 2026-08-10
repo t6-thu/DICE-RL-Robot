@@ -298,6 +298,82 @@ class YAMReplayBufferBoundaryTest(unittest.TestCase):
             self.assertEqual(shaper.shape_decay_flags, [False, False, True])
             self.assertEqual(shaper.outcome_decay_flags, [False, False, True])
 
+    def test_hire_rewards_are_causal_and_frozen_across_restart(self):
+        class CausalHireShaper:
+            def __init__(self):
+                self.buffer_size = 0
+                self.shape_calls = 0
+
+            @staticmethod
+            def is_ready():
+                return True
+
+            def shape_rewards(
+                self, rewards, images, horizon, adaptive_decay_enabled=True
+            ):
+                self.shape_calls += 1
+                return np.full(
+                    len(rewards) - horizon,
+                    float(self.buffer_size),
+                    dtype=np.float32,
+                )
+
+            def add_episode_to_buffer(self, images, success):
+                self.buffer_size += 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            expert_path = tmp_path / "expert.npz"
+            online_path = tmp_path / "online"
+            online_path.mkdir()
+            self._write_expert(expert_path)
+
+            for index in range(2):
+                states = np.full((3, 7), index, dtype=np.float32)
+                np.savez(
+                    online_path / f"episode_{index:04d}.npz",
+                    states=states,
+                    actions=states.copy(),
+                    images=np.full((3, 6, 2, 2), index, dtype=np.uint8),
+                    rewards=np.zeros(3, dtype=np.float32),
+                    dones=np.array([False, False, True]),
+                )
+
+            first_shaper = CausalHireShaper()
+            first = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(online_path),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                device="cpu",
+                hire_shaper=first_shaper,
+            )
+            self.assertEqual(first_shaper.shape_calls, 2)
+            self.assertEqual(first_shaper.buffer_size, 2)
+            self.assertEqual(first._online_episodes[0]["rewards_shaped"].item(), 0.0)
+            self.assertEqual(first._online_episodes[1]["rewards_shaped"].item(), 1.0)
+            cache_files = sorted((online_path / ".reward_cache").glob("*.npz"))
+            self.assertEqual(len(cache_files), 2)
+
+            # A new shaper starts empty, but restored episodes must use their
+            # exact cached rewards rather than recomputing with new buffers or
+            # new random HiRE samples.
+            second_shaper = CausalHireShaper()
+            second = YAMReplayBuffer(
+                expert_npz_path=str(expert_path),
+                online_data_dir=str(online_path),
+                obs_horizon=2,
+                action_dim=7,
+                action_horizon=2,
+                device="cpu",
+                hire_shaper=second_shaper,
+            )
+            self.assertEqual(second_shaper.shape_calls, 0)
+            self.assertEqual(second_shaper.buffer_size, 2)
+            self.assertEqual(second._online_episodes[0]["rewards_shaped"].item(), 0.0)
+            self.assertEqual(second._online_episodes[1]["rewards_shaped"].item(), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

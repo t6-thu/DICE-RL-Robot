@@ -21,8 +21,11 @@ plus ((1-expert_ratio) × batch_size) online transitions.
 
 from __future__ import annotations
 import glob
+import hashlib
+import json
 import logging
 import os
+import tempfile
 from collections import deque
 from typing import Dict, Optional
 
@@ -34,6 +37,9 @@ log = logging.getLogger(__name__)
 
 class YAMReplayBuffer:
     """Simple RLPD-compatible replay buffer for YAM joint-space policy."""
+
+    _REWARD_CACHE_SCHEMA_VERSION = 1
+    _REWARD_CACHE_DIRNAME = ".reward_cache"
 
     @staticmethod
     def _load_curation_include_ids(path: Optional[str], n_eps: int) -> Optional[list]:
@@ -176,7 +182,15 @@ class YAMReplayBuffer:
         for i, p in enumerate(paths):
             with np.load(p) as d:
                 episode = {k: d[k] for k in d.files}
-            self.add_episode(episode)
+            # Restore in causal order.  The episode's reward is loaded/computed
+            # before this episode is allowed to influence later HiRE rewards.
+            self.add_episode(episode, source_path=p)
+            if self.hire_shaper is not None and "images" in episode:
+                rewards = episode.get("rewards", np.zeros(1, dtype=np.float32))
+                success = bool(rewards[-1] > 0.5) if len(rewards) > 0 else False
+                self.hire_shaper.add_episode_to_buffer(
+                    episode["images"], success=success
+                )
             self.loaded_paths.append(p)
             if (i + 1) % 5 == 0 or (i + 1) == len(paths):
                 log.info("  … %d/%d episodes loaded", i + 1, len(paths))
@@ -219,7 +233,163 @@ class YAMReplayBuffer:
             self._online_episode_refcounts.get(episode_id, 0) + 1
         )
 
-    def add_episode(self, episode: dict) -> None:
+    def _reward_mode(self) -> str:
+        if self.robometer_shaper is not None:
+            return "robometer"
+        if self.hire_shaper is not None:
+            return "hire"
+        return "sparse"
+
+    def _reward_recipe_json(self) -> str:
+        """Stable description of every setting that changes shaped rewards."""
+        recipe = {
+            "schema_version": self._REWARD_CACHE_SCHEMA_VERSION,
+            "mode": self._reward_mode(),
+            "action_horizon": self.action_horizon,
+            "use_sparse_for_online_success": self.use_sparse_for_online_success,
+            "hire_pbrs_decay_start_episode": self.hire_pbrs_decay_start_episode,
+        }
+        if self.hire_shaper is not None:
+            for name in (
+                "cameras",
+                "reward_weight",
+                "contrastive_lambda",
+                "logsumexp_beta_pos",
+                "logsumexp_beta_neg",
+                "gamma_pbrs",
+                "sample_K",
+                "online_success_frames",
+                "online_failure_frames",
+                "expert_frame_stride",
+                "max_pos_buffer_size",
+                "max_neg_buffer_size",
+                "online_pos_ratio",
+                "adaptive_dense_weight_max",
+                "adaptive_dense_weight_min",
+                "adaptive_dense_weight_alpha",
+                "adaptive_success_rate_ema_decay",
+                "adaptive_success_rate_norm_cap",
+            ):
+                value = getattr(self.hire_shaper, name, None)
+                if isinstance(value, tuple):
+                    value = list(value)
+                recipe[f"hire.{name}"] = value
+        elif self.robometer_shaper is not None:
+            for name in (
+                "task_instruction",
+                "reward_weight",
+                "camera",
+                "use_frame_steps",
+                "max_frames",
+                "bgr_to_rgb",
+                "use_relative_rewards",
+                "gamma_pbrs",
+                "query_every_n_chunks",
+                "query_fill_mode",
+                "max_batch_size",
+            ):
+                recipe[f"robometer.{name}"] = getattr(
+                    self.robometer_shaper, name, None
+                )
+        return json.dumps(recipe, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _reward_input_digest(images: np.ndarray, rewards: np.ndarray) -> str:
+        """Bind a reward cache to the exact image/reward inputs it shaped."""
+        digest = hashlib.sha256()
+        for array in (images, rewards):
+            contiguous = np.ascontiguousarray(array)
+            digest.update(str(contiguous.dtype).encode("ascii"))
+            digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+            digest.update(memoryview(contiguous))
+        return digest.hexdigest()
+
+    def _reward_cache_path(self, source_path: str) -> str:
+        cache_dir = os.path.join(self.online_data_dir, self._REWARD_CACHE_DIRNAME)
+        return os.path.join(cache_dir, os.path.basename(source_path))
+
+    def _load_reward_cache(
+        self,
+        source_path: Optional[str],
+        expected_length: int,
+        input_digest: str,
+    ) -> Optional[np.ndarray]:
+        if source_path is None or self._reward_mode() == "sparse":
+            return None
+        cache_path = self._reward_cache_path(source_path)
+        if not os.path.isfile(cache_path):
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as cache:
+                schema = int(np.asarray(cache["schema_version"]).item())
+                recipe = str(np.asarray(cache["reward_recipe_json"]).item())
+                cached_digest = str(np.asarray(cache["input_digest"]).item())
+                rewards = np.asarray(cache["rewards_shaped"], dtype=np.float32)
+        except Exception as exc:
+            raise RuntimeError(
+                f"invalid shaped-reward cache {cache_path}: {exc}"
+            ) from exc
+        if schema != self._REWARD_CACHE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"shaped-reward cache schema mismatch for {source_path}: "
+                f"cached={schema} expected={self._REWARD_CACHE_SCHEMA_VERSION}"
+            )
+        if recipe != self._reward_recipe_json():
+            raise RuntimeError(
+                f"shaped-reward recipe mismatch for {source_path}; use a new "
+                "run directory instead of silently changing rewards in-place"
+            )
+        if cached_digest != input_digest:
+            raise RuntimeError(
+                f"episode contents changed after reward caching: {source_path}"
+            )
+        if len(rewards) != expected_length:
+            raise RuntimeError(
+                f"shaped-reward cache length mismatch for {source_path}: "
+                f"cached={len(rewards)} expected={expected_length}"
+            )
+        log.debug("Loaded frozen shaped rewards from %s", cache_path)
+        return np.ascontiguousarray(rewards, dtype=np.float32)
+
+    def _save_reward_cache(
+        self,
+        source_path: Optional[str],
+        rewards_shaped: np.ndarray,
+        input_digest: str,
+    ) -> None:
+        if source_path is None or self._reward_mode() == "sparse":
+            return
+        cache_path = self._reward_cache_path(source_path)
+        cache_dir = os.path.dirname(cache_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".reward-", suffix=".npz", dir=cache_dir
+        )
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    schema_version=np.int64(self._REWARD_CACHE_SCHEMA_VERSION),
+                    reward_recipe_json=np.asarray(self._reward_recipe_json()),
+                    input_digest=np.asarray(input_digest),
+                    rewards_shaped=np.ascontiguousarray(
+                        rewards_shaped, dtype=np.float32
+                    ),
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+        log.info("Frozen shaped rewards: %s", cache_path)
+
+    def add_episode(
+        self, episode: dict, source_path: Optional[str] = None
+    ) -> None:
         """Add one online rollout episode to the buffer.
 
         episode dict keys:
@@ -283,21 +453,36 @@ class YAMReplayBuffer:
             self._num_online_episodes += 1
             return
 
+        cacheable = source_path is not None and self._reward_mode() != "sparse"
+        input_digest = self._reward_input_digest(I, R_sparse) if cacheable else ""
+        R_shaped_tr = (
+            self._load_reward_cache(
+                source_path, expected_length=T - H, input_digest=input_digest
+            )
+            if cacheable
+            else None
+        )
+
         # HiRE PBRS shaping with H-step lookahead:
         #   r̃_t = R_sparse[t+H] + γ·Φ(s_{t+H}) − Φ(s_t)
         # Terminal boundary: Φ(s_{T-1}) = 0 (last frame of episode).
-        if self.robometer_shaper is not None and self.robometer_shaper.is_ready():
+        if R_shaped_tr is None and (
+            self.robometer_shaper is not None
+            and self.robometer_shaper.is_ready()
+        ):
             # Robometer-only dense reward (no sparse terminal term), like HiRE-Dice
             # robometer RLPD online rollouts.
             R_shaped_tr = self.robometer_shaper.shape_rewards(I, horizon=H)
-        elif self.hire_shaper is not None and self.hire_shaper.is_ready():
+        elif R_shaped_tr is None and (
+            self.hire_shaper is not None and self.hire_shaper.is_ready()
+        ):
             R_shaped_tr = self.hire_shaper.shape_rewards(
                 R_sparse,
                 I,
                 horizon=H,
                 adaptive_decay_enabled=adaptive_decay_enabled,
             )
-        else:
+        elif R_shaped_tr is None:
             # Fallback: use sparse reward at t+H with no shaping.
             R_shaped_tr = np.array(
                 [float(R_sparse[t + H]) for t in range(T - H)], dtype=np.float32
@@ -307,6 +492,10 @@ class YAMReplayBuffer:
                 "reward shaper returned the wrong number of transitions: "
                 f"expected {T - H}, got {len(R_shaped_tr)}"
             )
+        if cacheable and not os.path.isfile(
+            self._reward_cache_path(source_path)
+        ):
+            self._save_reward_cache(source_path, R_shaped_tr, input_digest)
 
         episode_id = self._next_online_episode_id
         self._next_online_episode_id += 1

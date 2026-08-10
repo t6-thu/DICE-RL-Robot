@@ -303,12 +303,22 @@ class YAMRLLearner:
             #    episodes (e.g. a previous HiRE checkpoint to resume from).
             #    Skipped when `hire_init_dir is None` so HiRE training starts
             #    from a clean slate, matching the baseline's fresh start.
-            if hire_init_dir is not None:
+            same_as_current_run = (
+                hire_init_dir is not None
+                and os.path.abspath(hire_init_dir)
+                == os.path.abspath(online_data_dir)
+            )
+            if hire_init_dir is not None and not same_as_current_run:
                 self.hire_shaper.build_initial_buffers_from_dir(hire_init_dir)
-            # 3) Always also scan the current ONLINE_DATA_DIR so a resumed run
-            #    picks up its own previously-collected episodes (no-op if empty).
-            if (hire_init_dir is None) or (online_data_dir != hire_init_dir):
-                self.hire_shaper.build_initial_buffers_from_dir(online_data_dir)
+            elif same_as_current_run:
+                log.info(
+                    "HiRE init dir is the current run; restoring it causally "
+                    "through replay instead of pre-seeding all episodes"
+                )
+            # Current-run episodes are deliberately NOT pre-seeded here.  The
+            # replay buffer restores them in filename order, freezes each
+            # episode's shaped reward, and only then adds that episode to the
+            # HiRE reference buffers.  This prevents self/future leakage.
             log.info("HiRE reward-recipe switch: use_sparse_for_online_success=%s",
                      self.use_sparse_for_online_success)
 
@@ -456,7 +466,7 @@ class YAMRLLearner:
             except Exception as e:
                 log.warning("Episode %s not yet readable (%s); will retry", p, e)
                 continue
-            self.replay_buffer.add_episode(ep_data)
+            self.replay_buffer.add_episode(ep_data, source_path=p)
             self.total_episodes += 1
             rewards = ep_data.get("rewards", np.zeros(1, dtype=np.float32))
             success = bool(rewards[-1] > 0.5) if len(rewards) > 0 else False
