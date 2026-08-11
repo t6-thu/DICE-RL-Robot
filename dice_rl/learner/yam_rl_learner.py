@@ -68,6 +68,7 @@ class YAMRLLearner:
         obs_horizon: int = 2,
         action_horizon: int = 16,
         action_dim: int = 7,
+        rl_num_inference_steps: int = 16,
         # RLPD
         use_rlpd: bool = True,
         expert_ratio: float = 0.5,
@@ -145,6 +146,9 @@ class YAMRLLearner:
         self.obs_horizon = obs_horizon
         self.action_horizon = action_horizon
         self.action_dim = action_dim
+        self.rl_num_inference_steps = int(rl_num_inference_steps)
+        if self.rl_num_inference_steps < 1:
+            raise ValueError("rl_num_inference_steps must be >= 1")
         self.gamma = gamma
         self.tau = tau
         self.bc_loss_weight = bc_loss_weight
@@ -479,11 +483,12 @@ class YAMRLLearner:
         bc_K_list, bc_next_K_list = [], []
         act_list, rew_list, done_list, is_expert_list = [], [], [], []
 
-        # Reduce BC diffusion steps during RL pool building to match original
-        # rl_num_inference_steps=8 (vs 16 used at deployment). 2× faster pool.
+        # Match BC diffusion steps used by real deployment.  This remains a
+        # local temporary override because the checkpoint may store a different
+        # default inference-step count.
         _orig_inf_steps = getattr(self.bc_policy, "num_inference_steps", None)
         if _orig_inf_steps is not None:
-            self.bc_policy.num_inference_steps = 8
+            self.bc_policy.num_inference_steps = self.rl_num_inference_steps
 
         n = 0
         while n < pool_size:

@@ -25,12 +25,15 @@ from dice_rl.learner.yam_rl_learner import YAMRLLearner
 # Robometer / reward toggles via env (see scripts/robometer/README.md).
 _training = apply_robometer_env_overrides(copy.deepcopy(TRAINING))
 _reward_mode = os.environ.get("YAM_REWARD_MODE", "").strip().lower()
-if _reward_mode in ("hire", ""):
+if _reward_mode in ("hire", "", "sparse"):
     pass
 elif _reward_mode == "robometer":
     pass  # apply_robometer_env_overrides already enabled it
 else:
-    raise ValueError(f"Unknown YAM_REWARD_MODE={_reward_mode!r} (use 'hire' or 'robometer')")
+    raise ValueError(
+        f"Unknown YAM_REWARD_MODE={_reward_mode!r} "
+        "(use 'hire', 'sparse', or 'robometer')"
+    )
 
 # Optional RUN_NAME override without editing yam_rl_config.py
 if os.environ.get("YAM_RUN_NAME"):

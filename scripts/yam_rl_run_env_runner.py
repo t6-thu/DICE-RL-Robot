@@ -26,6 +26,14 @@ _p.add_argument("--residual-scale", type=float, default=1.0,
                      "Use 0.0 to A/B-test pure BC, or 0.3 for a softer RL effect.")
 _args, _ = _p.parse_known_args()
 
+_hardware = apply_hardware_env_overrides(HARDWARE)
+_policy_camera_order = os.environ.get("YAM_POLICY_CAMERA_ORDER", "base_wrist").strip().lower()
+if _policy_camera_order not in ("base_wrist", "wrist_base"):
+    raise ValueError(
+        "YAM_POLICY_CAMERA_ORDER must be 'base_wrist' or 'wrist_base', got "
+        f"{_policy_camera_order!r}"
+    )
+
 runner = YAMRLEnvRunner(
     pretrained_policy_ckpt = BC_POLICY_CKPT,
     norm_npz_path          = NORM_NPZ,
@@ -36,7 +44,8 @@ runner = YAMRLEnvRunner(
     obs_horizon            = TRAINING["obs_horizon"],
     action_horizon         = TRAINING["action_horizon"],
     action_dim             = TRAINING["action_dim"],
-    **apply_hardware_env_overrides(HARDWARE),
+    policy_camera_order    = _policy_camera_order,
+    **_hardware,
     **COMM,
 )
 runner.run()

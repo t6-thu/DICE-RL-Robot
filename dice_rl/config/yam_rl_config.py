@@ -98,14 +98,28 @@ _data_dir  = os.environ.get("DICE_DATASET_FOLDERS",
 # ============================================================
 # TODO: set before running
 # ============================================================
-BC_POLICY_CKPT = os.path.expanduser(
+def _path_override(env_name: str, default: str) -> str:
+    """Return an optionally overridden path, expanding ``~`` in either case.
+
+    Task-specific launchers use this instead of editing this shared config.
+    The defaults intentionally preserve the original bottle experiment.
+    """
+    return os.path.expanduser(os.environ.get(env_name, default))
+
+
+BC_POLICY_CKPT = _path_override(
+    "YAM_BC_POLICY_CKPT",
     "~/training_outputs/2026.05.19/00.34.02_yam_vit_clip_v1_yam_picknplace_arizonabottle"
-    "/checkpoints/epoch=0500-train_loss=0.013.ckpt"
+    "/checkpoints/epoch=0500-train_loss=0.013.ckpt",
 )
-EXPERT_NPZ = os.path.join(_data_dir,
-                          "yam_picknplace_arizonabottle_224", "train.npz")
-NORM_NPZ   = os.path.join(_data_dir,
-                          "yam_picknplace_arizonabottle_224", "normalization.npz")
+EXPERT_NPZ = _path_override(
+    "YAM_EXPERT_NPZ",
+    os.path.join(_data_dir, "yam_picknplace_arizonabottle_224", "train.npz"),
+)
+NORM_NPZ = _path_override(
+    "YAM_NORM_NPZ",
+    os.path.join(_data_dir, "yam_picknplace_arizonabottle_224", "normalization.npz"),
+)
 # ---- Run name ----
 # Change this string to spin up a fresh experiment without touching previous
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
@@ -113,7 +127,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
 # For Robometer-only reward runs, use a distinct name, e.g.:
 #   RUN_NAME = "robometer_libero_w1"
-RUN_NAME        = "sparse_only_2000_1000"
+RUN_NAME        = os.environ.get("YAM_RUN_NAME", "sparse_only_2000_1000")
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -157,6 +171,9 @@ TRAINING = dict(
     obs_horizon = 2,         # must match BC training (2 frames of history)
     action_horizon = 16,     # must match BC training
     action_dim     = 7,      # YAM: 6 arm joints + 1 gripper
+    # Keep learner feature/BC-action generation aligned with real deployment.
+    # The old sparse prototype used 8 here only to accelerate pool building.
+    rl_num_inference_steps = 16,
 
     # --- RLPD expert ratio (anneals from 70% to 20%) ---
     use_adaptive_expert_ratio   = True,

@@ -87,10 +87,20 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_hardware_env_overrides(hardware: Dict[str, Any]) -> Dict[str, Any]:
-    """RealSense serials and capture size from env (robot PC)."""
+    """Apply robot-side launch overrides without mutating shared config."""
     out = dict(hardware)
     if os.environ.get("YAM_BASE_CAM_SERIAL"):
         out["base_cam_serial"] = _str("YAM_BASE_CAM_SERIAL", out["base_cam_serial"])
     if os.environ.get("YAM_WRIST_CAM_SERIAL"):
         out["wrist_cam_serial"] = _str("YAM_WRIST_CAM_SERIAL", out["wrist_cam_serial"])
+    if os.environ.get("YAM_CAN_CHANNEL"):
+        out["can_channel"] = _str("YAM_CAN_CHANNEL", out["can_channel"])
+    if os.environ.get("YAM_GRIPPER_TYPE"):
+        out["gripper_type"] = _str("YAM_GRIPPER_TYPE", out["gripper_type"])
+    if os.environ.get("YAM_CONTROL_HZ"):
+        out["control_hz"] = _float("YAM_CONTROL_HZ", out["control_hz"])
+    if os.environ.get("YAM_MAX_EPISODE_STEPS"):
+        out["max_episode_steps"] = _int(
+            "YAM_MAX_EPISODE_STEPS", out["max_episode_steps"]
+        )
     return out

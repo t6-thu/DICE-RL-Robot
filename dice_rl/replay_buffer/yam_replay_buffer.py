@@ -1,13 +1,9 @@
 """Replay buffer for DICE-RL finetuning of a joint-space diffusion policy on YAM.
 
-Design notes
-------------
-The buffer holds (obs, action, reward, next_obs, done) tuples where:
-  - obs / next_obs: a dict with keys {"rgb_0", "rgb_1", "joint_pos"}, each a
-    numpy array with a *cond_steps* time dimension (obs history).
-  - action: 7-D normalized joint target (same space as training data, [-1,1]).
-  - reward: scalar float (user-provided success/failure signal).
-  - done: bool.
+Online transitions are compact ``(episode_id, t)`` references.  Each episode's
+image/state/action arrays are retained once, and observations are materialised
+only for the sampled mini-batch.  This avoids the ~4.6 MiB per-transition cost
+of eagerly storing both image histories.
 
 Unlike the original DICE-RL HybridReplayBuffer (which reads DICE-RL-Robot zarr
 episodes processed from Cartesian-space SE(3) data), this buffer reads:
@@ -92,8 +88,18 @@ class YAMReplayBuffer:
         d = np.load(expert_npz_path)
         self._expert_states = d["states"].astype(np.float32)   # (T, 7) [-1,1]
         self._expert_actions = d["actions"].astype(np.float32) # (T, 7) [-1,1]
-        self._expert_images = d["images"]                       # (T, 6, H, W) uint8
+        image_sidecar = os.path.splitext(expert_npz_path)[0] + "_images.npy"
+        if os.path.isfile(image_sidecar):
+            self._expert_images = np.load(image_sidecar, mmap_mode="r")
+            log.info("Replay buffer: using mmap'd expert image sidecar %s",
+                     os.path.basename(image_sidecar))
+        else:
+            self._expert_images = d["images"]                   # (T, 6, H, W) uint8
         self._expert_traj_lengths = d["traj_lengths"].astype(int)
+        if len(self._expert_images) != len(self._expert_states):
+            raise ValueError("expert image/state length mismatch: "
+                             f"images={len(self._expert_images)} "
+                             f"states={len(self._expert_states)}")
         ep_starts = np.concatenate([[0], np.cumsum(self._expert_traj_lengths[:-1])])
         n_eps = int(len(self._expert_traj_lengths))
 
@@ -111,8 +117,8 @@ class YAMReplayBuffer:
         # Build valid (t, ep_start, ep_end_t) index triples for the expert
         # buffer.  Only include positions where a full action_horizon-step chunk
         # fits within the episode (mirrors BC training's valid index range).
-        # `ep_end_t` is the last valid t (= s + L - action_horizon), where the
-        # chunk actions[t:t+H] ends exactly at the episode's last frame.
+        # Keep next_obs at t+H inside the same episode.  The terminal chunk
+        # arrives at its last frame, rather than spilling into the next demo.
         self._expert_indices = []
         for ep, (s, length) in enumerate(zip(ep_starts, self._expert_traj_lengths)):
             if ep not in include_set:
@@ -120,8 +126,8 @@ class YAMReplayBuffer:
             s = int(s); L = int(length)
             if L <= self.action_horizon:
                 continue  # episode too short to form even one valid chunk
-            ep_end_t = s + L - self.action_horizon   # last valid t with full H-step chunk
-            for t in range(s, s + L - self.action_horizon + 1):
+            ep_end_t = s + L - self.action_horizon - 1
+            for t in range(s, s + L - self.action_horizon):
                 self._expert_indices.append((t, s, ep_end_t))
         self._expert_indices = np.array(self._expert_indices, dtype=np.int64)
         log.info("Expert buffer: %d transitions from %d episodes (of %d total in npz)",
@@ -130,8 +136,13 @@ class YAMReplayBuffer:
         # ---- online buffer (ring buffer for rollout data) ----
         self.online_data_dir = online_data_dir
         os.makedirs(online_data_dir, exist_ok=True)
-        self._max_online = max_online_size
+        self._max_online = int(max_online_size)
+        if self._max_online <= 0:
+            raise ValueError("max_online_size must be positive")
         self._online: deque = deque(maxlen=max_online_size)
+        self._online_episodes: Dict[int, dict] = {}
+        self._online_episode_refcounts: Dict[int, int] = {}
+        self._next_online_episode_id = 0
         self._num_online_episodes = 0
         self._load_existing_episodes()
 
@@ -146,13 +157,44 @@ class YAMReplayBuffer:
             return
         log.info("Loading %d saved episodes from disk (please wait)…", len(paths))
         for i, p in enumerate(paths):
-            d = np.load(p)
-            self.add_episode({k: d[k] for k in d.files})
+            with np.load(p) as d:
+                self.add_episode({k: d[k] for k in d.files})
             self.loaded_paths.append(p)
             if (i + 1) % 5 == 0 or (i + 1) == len(paths):
                 log.info("  … %d/%d episodes loaded", i + 1, len(paths))
-        log.info("Online buffer restored: %d transitions from %d episodes",
-                 len(self._online), self._num_online_episodes)
+        log.info("Online buffer restored: %d transitions from %d episodes "
+                 "(compact episode arrays: %.2f GiB)",
+                 len(self._online), self._num_online_episodes,
+                 self.online_storage_bytes / (1024 ** 3))
+
+    @staticmethod
+    def _compact_images(images: np.ndarray) -> np.ndarray:
+        """Keep online images once in compact uint8 policy channel order."""
+        images = np.asarray(images)
+        if images.dtype == np.uint8:
+            return np.ascontiguousarray(images)
+        images_f = images.astype(np.float32, copy=False)
+        if images_f.size:
+            lo, hi = float(images_f.min()), float(images_f.max())
+            if lo < 0.0 or hi > 1.0:
+                raise ValueError("float online images must be in [0, 1], "
+                                 f"got min={lo:.4f} max={hi:.4f}")
+        return np.rint(images_f * 255.0).clip(0, 255).astype(np.uint8)
+
+    def _append_online_ref(self, episode_id: int, t: int) -> None:
+        """Append an index reference and release fully evicted episodes."""
+        if len(self._online) == self._max_online:
+            old_episode_id, _ = self._online[0]
+            remaining = self._online_episode_refcounts[old_episode_id] - 1
+            if remaining == 0 and old_episode_id != episode_id:
+                del self._online_episode_refcounts[old_episode_id]
+                del self._online_episodes[old_episode_id]
+            else:
+                self._online_episode_refcounts[old_episode_id] = remaining
+        self._online.append((episode_id, int(t)))
+        self._online_episode_refcounts[episode_id] = (
+            self._online_episode_refcounts.get(episode_id, 0) + 1
+        )
 
     def add_episode(self, episode: dict) -> None:
         """Add one online rollout episode to the buffer.
@@ -173,14 +215,18 @@ class YAMReplayBuffer:
             reward   = R_sparse[t + action_horizon]               ← reward on arrival
             done     = D[t + action_horizon]
         """
-        S = episode["states"]
-        A = episode["actions"]
-        R_sparse = np.asarray(episode["rewards"], dtype=np.float32)
-        D = episode["dones"]
-        I = episode["images"]
+        S = np.ascontiguousarray(episode["states"], dtype=np.float32)
+        A = np.ascontiguousarray(episode["actions"], dtype=np.float32)
+        R_sparse = np.ascontiguousarray(episode["rewards"], dtype=np.float32)
+        D = np.ascontiguousarray(episode["dones"], dtype=bool)
+        I = self._compact_images(episode["images"])
         T = len(S)
         H = self.action_horizon
-        ep_start = 0
+
+        if not (len(A) == len(R_sparse) == len(D) == len(I) == T):
+            raise ValueError("online episode arrays must have equal leading lengths: "
+                             f"states={T} actions={len(A)} rewards={len(R_sparse)} "
+                             f"dones={len(D)} images={len(I)}")
 
         if T <= H:
             log.debug("Episode too short (%d frames) for even one chunk, skipping", T)
@@ -204,16 +250,24 @@ class YAMReplayBuffer:
                 [float(R_sparse[t + H]) for t in range(T - H)], dtype=np.float32
             )
 
+        if len(R_shaped_tr) != T - H:
+            raise ValueError("reward shaper returned the wrong number of transitions: "
+                             f"expected {T - H}, got {len(R_shaped_tr)}")
+
+        episode_id = self._next_online_episode_id
+        self._next_online_episode_id += 1
+        self._online_episodes[episode_id] = {
+            "images": I,
+            "states": S,
+            "actions": A,
+            "rewards_sparse": R_sparse,
+            "rewards_shaped": np.ascontiguousarray(R_shaped_tr, dtype=np.float32),
+            "dones": D,
+            "success": success,
+        }
+        self._online_episode_refcounts[episode_id] = 0
         for t in range(T - H):
-            obs      = self._make_obs(I, S, t,     ep_start)
-            next_obs = self._make_obs(I, S, t + H, ep_start)
-            chunk    = A[t : t + H]                    # (H, 7) real consecutive actions
-            r_sparse = float(R_sparse[t + H])
-            done     = bool(D[t + H])
-            # Tuple format: (obs, action, r_shaped, r_sparse, is_success, next_obs, done)
-            self._online.append((obs, chunk,
-                                 float(R_shaped_tr[t]), r_sparse,
-                                 success, next_obs, done))
+            self._append_online_ref(episode_id, t)
 
         self._num_online_episodes += 1
         log.debug("Online buffer: %d transitions from %d episodes",
@@ -282,11 +336,20 @@ class YAMReplayBuffer:
         return _pack(obs_list, acts, rews, next_obs_list, dones, dev, is_expert=True)
 
     def _sample_online(self, n: int, dev: torch.device) -> dict:
-        online_list = list(self._online)
-        idxs = np.random.randint(0, len(online_list), n)
+        online_refs = list(self._online)
+        idxs = np.random.randint(0, len(online_refs), n)
         obs_list, next_obs_list, acts, rews, dones = [], [], [], [], []
         for i in idxs:
-            o, a, r_shaped, r_sparse, is_success, no, d = online_list[i]
+            episode_id, t = online_refs[i]
+            episode = self._online_episodes[episode_id]
+            H = self.action_horizon
+            o = self._make_obs(episode["images"], episode["states"], t, ep_start=0)
+            no = self._make_obs(episode["images"], episode["states"], t + H, ep_start=0)
+            a = episode["actions"][t:t + H]
+            r_shaped = float(episode["rewards_shaped"][t])
+            r_sparse = float(episode["rewards_sparse"][t + H])
+            is_success = bool(episode["success"])
+            d = bool(episode["dones"][t + H])
             # Online-success switch (HiRE only): revert success transitions to sparse.
             # Robometer mode always uses shaped rewards for all online transitions.
             if (
@@ -304,6 +367,14 @@ class YAMReplayBuffer:
     @property
     def num_online_transitions(self) -> int:
         return len(self._online)
+
+    @property
+    def online_storage_bytes(self) -> int:
+        """Bytes held by compact, unique online episode arrays."""
+        return sum(array.nbytes
+                   for episode in self._online_episodes.values()
+                   for array in episode.values()
+                   if isinstance(array, np.ndarray))
 
     @property
     def num_expert_transitions(self) -> int:

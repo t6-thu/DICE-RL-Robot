@@ -44,6 +44,7 @@ from dice_rl.config.yam_rl_config import (
     BC_POLICY_CKPT, NORM_NPZ, RUN_NAME, ONLINE_DATA_DIR, RL_CKPT_DIR,
     TRAINING, NETWORK, HARDWARE, COMM,
 )
+from dice_rl.config.yam_env_overrides import apply_hardware_env_overrides
 from dice_rl.env_runner.yam_rl_env_runner import YAMRLEnvRunner
 from dice_rl.model.distill_rl import DistilledActor
 
@@ -113,7 +114,18 @@ def main():
                    help="root dir for saved eval episodes")
     p.add_argument("--residual-scale", type=float, default=1.0,
                    help="scale on actor delta (matches env_runner default 1.0)")
+    p.add_argument("--num-episodes", type=int, default=None,
+                   help="stop after this many non-discarded episodes for the selected checkpoint")
     args = p.parse_args()
+    if args.num_episodes is not None and args.num_episodes <= 0:
+        p.error("--num-episodes must be positive")
+
+    hardware = apply_hardware_env_overrides(HARDWARE)
+    policy_camera_order = os.environ.get(
+        "YAM_POLICY_CAMERA_ORDER", "base_wrist"
+    ).strip().lower()
+    if policy_camera_order not in ("base_wrist", "wrist_base"):
+        p.error("YAM_POLICY_CAMERA_ORDER must be 'base_wrist' or 'wrist_base'")
 
     # Build the env runner with NO weights-watch path → it never auto-loads
     # latest_actor.pt under our feet during eval.
@@ -121,17 +133,18 @@ def main():
     runner = YAMRLEnvRunner(
         pretrained_policy_ckpt=BC_POLICY_CKPT,
         norm_npz_path=NORM_NPZ,
-        base_cam_serial=HARDWARE["base_cam_serial"],
-        wrist_cam_serial=HARDWARE["wrist_cam_serial"],
-        can_channel=HARDWARE["can_channel"],
-        gripper_type=HARDWARE["gripper_type"],
-        home_joint_pos=HARDWARE["home_joint_pos"],
-        home_gripper_pos=HARDWARE["home_gripper_pos"],
-        control_hz=HARDWARE["control_hz"],
-        max_episode_steps=HARDWARE["max_episode_steps"],
+        base_cam_serial=hardware["base_cam_serial"],
+        wrist_cam_serial=hardware["wrist_cam_serial"],
+        can_channel=hardware["can_channel"],
+        gripper_type=hardware["gripper_type"],
+        home_joint_pos=hardware["home_joint_pos"],
+        home_gripper_pos=hardware["home_gripper_pos"],
+        control_hz=hardware["control_hz"],
+        max_episode_steps=hardware["max_episode_steps"],
         obs_horizon=TRAINING["obs_horizon"],
         action_horizon=TRAINING["action_horizon"],
         action_dim=TRAINING["action_dim"],
+        policy_camera_order=policy_camera_order,
         actor_hidden_dims=NETWORK["actor_hidden_dims"],
         residual_scale=args.residual_scale,
         online_data_dir="/tmp/_eval_dummy_unused",   # we override save dir ourselves
@@ -200,7 +213,14 @@ def main():
                 except Exception: pass
 
         # Inner episode loop with the chosen ckpt.
+        completed_this_choice = 0
         while True:
+            if (args.num_episodes is not None
+                    and completed_this_choice >= args.num_episodes):
+                log.info("Completed requested %d eval episodes for %s",
+                         args.num_episodes, label)
+                choice = None
+                break
             actor_info = (f"actor step={runner._actor_step}"
                           if runner.actor is not None else "pure BC")
             t = tally[label]
@@ -239,12 +259,14 @@ def main():
                 actions=ep_data["actions"],
                 rewards=ep_data["rewards"],
                 dones=ep_data["dones"],
+                policy_camera_order=ep_data["policy_camera_order"],
             )
             tot = tally[label]["s"] + tally[label]["f"]
             sr  = tally[label]["s"] / max(tot, 1) * 100.0
             log.info("Saved %s  (success=%s)  → %s/%s = %.1f%%",
                      os.path.basename(ep_path), ok, tally[label]["s"], tot, sr)
             ep_idx += 1
+            completed_this_choice += 1
             runner._move_to_home()
 
     # ---- final summary ----
