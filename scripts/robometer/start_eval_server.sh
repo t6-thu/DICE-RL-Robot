@@ -14,29 +14,18 @@
 
 set -euo pipefail
 
-ROBOMETER_ROOT="${ROBOMETER_ROOT:-$HOME/hanzht/robometer}"
+ROBOMETER_ROOT="${ROBOMETER_ROOT:-$HOME/文档/Robometer}"
 PORT="${PORT:-8000}"
 GPU="${GPU:-0}"
 GPUS="${GPUS:-1}"
 MODEL_PATH="${MODEL_PATH:-robometer/Robometer-4B}"
 
-CONDA_ENV="${CONDA_ENV:-}"
-if [[ -z "${CONDA_ENV}" ]]; then
-  if command -v conda >/dev/null 2>&1; then
-    if conda env list | awk '{print $1}' | grep -qx "robometer"; then
-      CONDA_ENV="robometer"
-    elif conda env list | awk '{print $1}' | grep -qx "roboreward"; then
-      CONDA_ENV="roboreward"
-    fi
-  fi
-fi
-if [[ -z "${CONDA_ENV}" ]]; then
-  echo "No conda env robometer/roboreward. Set ROBOMETER_ROOT and install robometer." >&2
+PYTHON="${ROBOMETER_PYTHON:-$ROBOMETER_ROOT/.venv/bin/python}"
+if [[ ! -x "${PYTHON}" ]]; then
+  echo "Robometer Python not found: ${PYTHON}" >&2
+  echo "Set ROBOMETER_ROOT or ROBOMETER_PYTHON." >&2
   exit 1
 fi
-
-eval "$(conda shell.bash hook)"
-conda activate "${CONDA_ENV}"
 
 export CUDA_VISIBLE_DEVICES="${GPU}"
 export PORT
@@ -45,7 +34,6 @@ export MODEL_PATH
 
 cd "${ROBOMETER_ROOT}"
 echo "Robometer server: port=${PORT} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} GPUS=${GPUS}"
-PYTHON="$(command -v python)"
 exec "${PYTHON}" robometer/evals/eval_server.py \
   model_path="${MODEL_PATH}" \
   server_url=0.0.0.0 \

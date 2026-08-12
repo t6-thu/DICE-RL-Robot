@@ -104,11 +104,30 @@ class YAMReplayBuffer:
 
         # ---- expert buffer (preloaded from BC training npz) ----
         log.info("Loading expert data from %s", expert_npz_path)
-        d = np.load(expert_npz_path)
-        self._expert_states = d["states"].astype(np.float32)   # (T, 7) [-1,1]
-        self._expert_actions = d["actions"].astype(np.float32) # (T, 7) [-1,1]
-        self._expert_images = d["images"]                       # (T, 6, H, W) uint8
-        self._expert_traj_lengths = d["traj_lengths"].astype(int)
+        # The recovered Hanoi dataset has a ``train_images.npy`` sidecar.  Map
+        # it instead of eagerly decompressing the image member of the npz: it
+        # has identical samples but avoids a multi-GiB RAM spike when the
+        # learner starts alongside the Robometer service.
+        image_sidecar = os.path.splitext(expert_npz_path)[0] + "_images.npy"
+        with np.load(expert_npz_path) as d:
+            self._expert_states = d["states"].astype(np.float32)   # (T, 7) [-1,1]
+            self._expert_actions = d["actions"].astype(np.float32) # (T, 7) [-1,1]
+            self._expert_traj_lengths = d["traj_lengths"].astype(int)
+            if os.path.isfile(image_sidecar):
+                self._expert_images = np.load(image_sidecar, mmap_mode="r")
+                if (
+                    self._expert_images.ndim != 4
+                    or self._expert_images.shape[0] != len(self._expert_states)
+                    or self._expert_images.shape[1] != 6
+                ):
+                    raise ValueError(
+                        f"Invalid expert image sidecar {image_sidecar}: "
+                        f"expected (T, 6, H, W) with T={len(self._expert_states)}, "
+                        f"got {self._expert_images.shape}"
+                    )
+                log.info("Expert images memory-mapped from %s", image_sidecar)
+            else:
+                self._expert_images = d["images"]  # (T, 6, H, W) uint8
         ep_starts = np.concatenate([[0], np.cumsum(self._expert_traj_lengths[:-1])])
         n_eps = int(len(self._expert_traj_lengths))
 
@@ -126,8 +145,10 @@ class YAMReplayBuffer:
         # Build valid (t, ep_start, ep_end_t) index triples for the expert
         # buffer.  Only include positions where a full action_horizon-step chunk
         # fits within the episode (mirrors BC training's valid index range).
-        # `ep_end_t` is the last valid t (= s + L - action_horizon), where the
-        # chunk actions[t:t+H] ends exactly at the episode's last frame.
+        # `ep_end_t` is the last valid t (= s + L - action_horizon - 1): its
+        # action chunk ends at the final frame and its next observation at
+        # t+H remains inside this episode.  This is intentionally the same
+        # [0, T-H) range used for online rollouts.
         self._expert_indices = []
         for ep, (s, length) in enumerate(zip(ep_starts, self._expert_traj_lengths)):
             if ep not in include_set:
@@ -135,8 +156,8 @@ class YAMReplayBuffer:
             s = int(s); L = int(length)
             if L <= self.action_horizon:
                 continue  # episode too short to form even one valid chunk
-            ep_end_t = s + L - self.action_horizon   # last valid t with full H-step chunk
-            for t in range(s, s + L - self.action_horizon + 1):
+            ep_end_t = s + L - self.action_horizon - 1
+            for t in range(s, s + L - self.action_horizon):
                 self._expert_indices.append((t, s, ep_end_t))
         self._expert_indices = np.array(self._expert_indices, dtype=np.int64)
         log.info("Expert buffer: %d transitions from %d episodes (of %d total in npz)",
@@ -457,8 +478,8 @@ class YAMReplayBuffer:
             acts.append(self._expert_actions[t : t + H])
             # next_obs is one full action chunk ahead (t+H), matching the original
             # SequenceSampler which sets next_query_time = query_time + chunk_duration_ms.
-            # ep_end_t = s + L - H, so at the terminal t, next_obs lands on the
-            # episode's last frame exactly.
+            # ep_end_t = s + L - H - 1, so at the terminal t, next_obs lands
+            # on the episode's last frame exactly (never the next episode).
             is_terminal = (int(t) == int(ep_end_t))
             rews.append(1.0 if is_terminal else 0.0)
             dones.append(is_terminal)

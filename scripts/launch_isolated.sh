@@ -30,7 +30,7 @@
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-ROBOMETER_DIR="$HOME/Documents/niu/Robometer"
+ROBOMETER_DIR="${ROBOMETER_DIR:-$HOME/文档/Robometer}"
 
 ENV_CORES="0-5"
 HEAVY_CORES="6-23"
@@ -46,7 +46,7 @@ case "$ROLE" in
     cd "$ROBOMETER_DIR"
     exec env OMP_NUM_THREADS="$ROBOMETER_THREADS" MKL_NUM_THREADS="$ROBOMETER_THREADS" OPENBLAS_NUM_THREADS="$ROBOMETER_THREADS" \
       taskset -c "$HEAVY_CORES" nice -n 10 \
-      uv run python robometer/evals/eval_server.py \
+      "$ROBOMETER_DIR/.venv/bin/python" robometer/evals/eval_server.py \
         model_path=robometer/Robometer-4B \
         server_url=0.0.0.0 server_port=8000 num_gpus=1 batch_size="$ROBOMETER_BATCH_SIZE"
     ;;

@@ -67,6 +67,7 @@ class RobometerEpisodeRewardShaper:
         task_instruction: str,
         reward_weight: float = 1.0,
         camera: str = "base",
+        policy_camera_order: str = "base_wrist",
         use_frame_steps: bool = False,
         max_frames: int = 16,
         request_timeout_s: float = 120.0,
@@ -81,6 +82,12 @@ class RobometerEpisodeRewardShaper:
         self.task_instruction = str(task_instruction)
         self.reward_weight = float(reward_weight)
         self.camera = resolve_yam_robometer_camera(camera)
+        self.policy_camera_order = str(policy_camera_order).strip().lower()
+        if self.policy_camera_order not in ("base_wrist", "wrist_base"):
+            raise ValueError(
+                "policy_camera_order must be 'base_wrist' or 'wrist_base', got "
+                f"{self.policy_camera_order!r}"
+            )
         self.use_frame_steps = bool(use_frame_steps)
         self.max_frames = int(max_frames)
         self.request_timeout_s = float(request_timeout_s)
@@ -106,10 +113,11 @@ class RobometerEpisodeRewardShaper:
                     self.server_url,
                 )
             log.info(
-                "Robometer YAM shaper: task=%r camera=%s weight=%.3f "
+                "Robometer YAM shaper: task=%r camera=%s order=%s weight=%.3f "
                 "relative=%s max_frames=%d query_every_n_chunks=%d fill=%s gamma_pbrs=%.3f",
                 self.task_instruction,
                 self.camera,
+                self.policy_camera_order,
                 self.reward_weight,
                 self.use_relative_rewards,
                 self.max_frames,
@@ -124,10 +132,11 @@ class RobometerEpisodeRewardShaper:
     def cache_key(self, horizon: int) -> str:
         """Stable key for invalidating per-episode reward cache files."""
         payload = {
-            "version": 1,
+            "version": 2,
             "task_instruction": self.task_instruction,
             "reward_weight": self.reward_weight,
             "camera": self.camera,
+            "policy_camera_order": self.policy_camera_order,
             "use_frame_steps": self.use_frame_steps,
             "max_frames": self.max_frames,
             "request_timeout_s": self.request_timeout_s,
@@ -146,10 +155,14 @@ class RobometerEpisodeRewardShaper:
         imgs = np.asarray(images_T6HW)
         if imgs.ndim != 4 or imgs.shape[1] != 6:
             raise ValueError(f"Expected images (T, 6, H, W), got {imgs.shape}")
+        if self.policy_camera_order == "base_wrist":
+            base, wrist = imgs[:, :3], imgs[:, 3:]
+        else:
+            wrist, base = imgs[:, :3], imgs[:, 3:]
         if self.camera == "base":
-            raw = imgs[:, :3]
+            raw = base
         elif self.camera == "wrist":
-            raw = imgs[:, 3:]
+            raw = wrist
         else:
             raise ValueError(f"camera must be 'base' or 'wrist', got {self.camera!r}")
 
@@ -170,7 +183,14 @@ class RobometerEpisodeRewardShaper:
         return out
 
     def _frames_for_server(self, frames_thwc: np.ndarray) -> np.ndarray:
-        return subsample_trajectory_frames(frames_thwc, self.max_frames)
+        frames = subsample_trajectory_frames(frames_thwc, self.max_frames)
+        # Robometer-4B's progress collator currently rejects a one-frame
+        # sample (the first checkpoint of every trajectory).  Duplicate that
+        # frame only for inference: it preserves the same visual state and
+        # lets us recover a well-defined initial progress value.
+        if len(frames) == 1:
+            frames = np.repeat(frames, 2, axis=0)
+        return frames
 
     @staticmethod
     def _progress_scalar(progress_curve: np.ndarray) -> float:

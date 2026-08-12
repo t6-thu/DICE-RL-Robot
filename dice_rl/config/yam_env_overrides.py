@@ -48,6 +48,7 @@ def apply_robometer_env_overrides(training: Dict[str, Any]) -> Dict[str, Any]:
         "robometer_task_instruction": ("YAM_ROBOMETER_TASK_INSTRUCTION",),
         "robometer_reward_weight": ("ROBOMETER_REWARD_WEIGHT", "YAM_ROBOMETER_REWARD_WEIGHT"),
         "robometer_camera": ("YAM_ROBOMETER_CAMERA", "ROBOMETER_CAMERA_KEY"),
+        "robometer_policy_camera_order": ("YAM_POLICY_CAMERA_ORDER",),
         "robometer_query_fill_mode": ("YAM_ROBOMETER_QUERY_FILL_MODE",),
         "robometer_max_batch_size": ("YAM_ROBOMETER_MAX_BATCH_SIZE",),
         "robometer_query_every_n_chunks": ("YAM_ROBOMETER_QUERY_EVERY_N_CHUNKS",),
@@ -141,4 +142,12 @@ def apply_hardware_env_overrides(hardware: Dict[str, Any]) -> Dict[str, Any]:
         out["base_cam_serial"] = _str("YAM_BASE_CAM_SERIAL", out["base_cam_serial"])
     if os.environ.get("YAM_WRIST_CAM_SERIAL"):
         out["wrist_cam_serial"] = _str("YAM_WRIST_CAM_SERIAL", out["wrist_cam_serial"])
+    if os.environ.get("YAM_CAN_CHANNEL"):
+        out["can_channel"] = _str("YAM_CAN_CHANNEL", out["can_channel"])
+    if os.environ.get("YAM_CONTROL_HZ"):
+        out["control_hz"] = _float("YAM_CONTROL_HZ", out["control_hz"])
+    if os.environ.get("YAM_MAX_EPISODE_STEPS"):
+        out["max_episode_steps"] = _int(
+            "YAM_MAX_EPISODE_STEPS", out["max_episode_steps"]
+        )
     return out

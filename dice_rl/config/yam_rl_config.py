@@ -98,14 +98,24 @@ _data_dir  = os.environ.get("DICE_DATASET_FOLDERS",
 # ============================================================
 # TODO: set before running
 # ============================================================
-BC_POLICY_CKPT = os.path.expanduser(
+def _path_override(env_name: str, default: str) -> str:
+    """Use task-specific launch paths without changing shared defaults."""
+    return os.path.expanduser(os.environ.get(env_name, default))
+
+
+BC_POLICY_CKPT = _path_override(
+    "YAM_BC_POLICY_CKPT",
     "~/training_outputs/2026.05.19/00.34.02_yam_vit_clip_v1_yam_picknplace_arizonabottle"
-    "/checkpoints/epoch=0500-train_loss=0.013.ckpt"
+    "/checkpoints/epoch=0500-train_loss=0.013.ckpt",
 )
-EXPERT_NPZ = os.path.join(_data_dir,
-                          "yam_picknplace_arizonabottle_224", "train.npz")
-NORM_NPZ   = os.path.join(_data_dir,
-                          "yam_picknplace_arizonabottle_224", "normalization.npz")
+EXPERT_NPZ = _path_override(
+    "YAM_EXPERT_NPZ",
+    os.path.join(_data_dir, "yam_picknplace_arizonabottle_224", "train.npz"),
+)
+NORM_NPZ = _path_override(
+    "YAM_NORM_NPZ",
+    os.path.join(_data_dir, "yam_picknplace_arizonabottle_224", "normalization.npz"),
+)
 # ---- Run name ----
 # Change this string to spin up a fresh experiment without touching previous
 # data / checkpoints / logs. Each value of RUN_NAME owns its own:
@@ -113,7 +123,7 @@ NORM_NPZ   = os.path.join(_data_dir,
 #   ~/training_outputs/yam_rl_finetuning_<RUN_NAME>/       ← ckpts + learner.log + plots
 # For Robometer-only reward runs, use a distinct name, e.g.:
 #   RUN_NAME = "robometer_libero_w1"
-RUN_NAME        = "robometer_2000_1000"
+RUN_NAME        = os.environ.get("YAM_RUN_NAME", "robometer_2000_1000")
 ONLINE_DATA_DIR = os.path.join(_data_dir, f"yam_rl_rollouts_{RUN_NAME}")
 RL_CKPT_DIR     = os.path.join(_ckpt_dir, f"yam_rl_finetuning_{RUN_NAME}")
 
@@ -220,6 +230,9 @@ TRAINING = dict(
     # HiRE-Dice sideview_image / agentview_image → use "base" on YAM unless you
     # intentionally want wrist progress, then "wrist".
     robometer_camera               = "base",
+    # Physical channel order in stored episode images.  Default preserves the
+    # historic bottle setup; Hanoi overrides this to wrist_base.
+    robometer_policy_camera_order  = os.environ.get("YAM_POLICY_CAMERA_ORDER", "base_wrist"),
     robometer_use_frame_steps      = False,
     robometer_max_frames           = 16,
     robometer_request_timeout_s    = 120.0,

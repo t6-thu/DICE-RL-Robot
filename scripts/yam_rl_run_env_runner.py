@@ -35,6 +35,14 @@ _p.add_argument("--no-wait-learner", action="store_true",
                      "the env runner. Mainly for debugging.")
 _args, _ = _p.parse_known_args()
 
+_hardware = apply_hardware_env_overrides(HARDWARE)
+_policy_camera_order = os.environ.get("YAM_POLICY_CAMERA_ORDER", "base_wrist").strip().lower()
+if _policy_camera_order not in ("base_wrist", "wrist_base"):
+    raise ValueError(
+        "YAM_POLICY_CAMERA_ORDER must be 'base_wrist' or 'wrist_base', got "
+        f"{_policy_camera_order!r}"
+    )
+
 
 def _pid_alive(pid) -> bool:
     if not isinstance(pid, int) or pid <= 0:
@@ -91,7 +99,8 @@ runner = YAMRLEnvRunner(
     obs_horizon            = TRAINING["obs_horizon"],
     action_horizon         = TRAINING["action_horizon"],
     action_dim             = TRAINING["action_dim"],
-    **apply_hardware_env_overrides(HARDWARE),
+    policy_camera_order    = _policy_camera_order,
+    **_hardware,
     **COMM,
 )
 runner.run()

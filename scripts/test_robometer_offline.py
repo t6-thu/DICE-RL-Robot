@@ -76,6 +76,7 @@ def main() -> None:
     cfg["use_robometer_reward"] = True
     print(f"  robometer_use_relative_rewards = {cfg.get('robometer_use_relative_rewards')}")
     print(f"  robometer_camera = {cfg.get('robometer_camera')}")
+    print(f"  policy_camera_order = {cfg.get('robometer_policy_camera_order')}")
     print(f"  alias sideview_image -> {resolve_yam_robometer_camera('sideview_image')}")
 
     if args.dry_run:
@@ -103,6 +104,7 @@ def main() -> None:
         task_instruction=str(cfg["robometer_task_instruction"]),
         reward_weight=float(cfg["robometer_reward_weight"]),
         camera=str(cfg["robometer_camera"]),
+        policy_camera_order=str(cfg.get("robometer_policy_camera_order", "base_wrist")),
         use_frame_steps=bool(cfg.get("robometer_use_frame_steps", False)),
         max_frames=int(cfg.get("robometer_max_frames", 16)),
         request_timeout_s=float(cfg.get("robometer_request_timeout_s", 120.0)),

@@ -160,6 +160,7 @@ class YAMRLEnvRunner:
         obs_horizon: int = 2,
         action_horizon: int = 16,
         action_dim: int = 7,
+        policy_camera_order: str = "base_wrist",
         # Actor (residual RL)
         actor_hidden_dims: list = None,
         residual_scale: float = 1.0,  # scale on actor's delta — set <1 to soften RL effect
@@ -181,6 +182,12 @@ class YAMRLEnvRunner:
         self.control_hz = control_hz
         self.period = 1.0 / control_hz
         self.max_episode_steps = max_episode_steps
+        self.policy_camera_order = str(policy_camera_order).strip().lower()
+        if self.policy_camera_order not in ("base_wrist", "wrist_base"):
+            raise ValueError(
+                "policy_camera_order must be 'base_wrist' or 'wrist_base', got "
+                f"{self.policy_camera_order!r}"
+            )
         self.max_episodes = (
             int(max_episodes) if max_episodes is not None and int(max_episodes) > 0
             else None
@@ -246,6 +253,10 @@ class YAMRLEnvRunner:
         self.wrist_cam = _SyncCamera(wrist_cam_serial, 640, 480, 30, "wrist")
         try:
             self.base_cam.start(); self.wrist_cam.start()
+            first = "base" if self.policy_camera_order == "base_wrist" else "wrist"
+            second = "wrist" if first == "base" else "base"
+            log.info("Policy camera order: %s (rgb_0=%s rgb_1=%s)",
+                     self.policy_camera_order, first, second)
         except Exception:
             self.base_cam.stop()
             self.wrist_cam.stop()
@@ -298,6 +309,12 @@ class YAMRLEnvRunner:
         jnt  = torch.from_numpy(s_norm)[None].to(self.device).float()
         return {"sparse": {"rgb_0": rgb0, "rgb_1": rgb1, "joint_pos": jnt}}
 
+    def _pack_policy_images(self, base: np.ndarray, wrist: np.ndarray) -> np.ndarray:
+        """Pack physical cameras in the channel order expected by the policy."""
+        if self.policy_camera_order == "wrist_base":
+            return np.concatenate([wrist, base], axis=0)
+        return np.concatenate([base, wrist], axis=0)
+
     def _infer(self, obs_tensors) -> np.ndarray:
         """Run BC policy (+ optional residual actor) → (action_horizon, 7) raw i2rt."""
         nobs = {k: self.bc_policy.sparse_normalizer[k].normalize(v)
@@ -343,7 +360,7 @@ class YAMRLEnvRunner:
                 f"wrist={'ok' if w is not None else 'None'}) — "
                 "check USB connection / move wrist cam to a USB-3 port")
         b = _preprocess(b); w = _preprocess(w)
-        img0 = np.concatenate([b, w], axis=0)  # (6, 224, 224)
+        img0 = self._pack_policy_images(b, w)  # (rgb_0, rgb_1), (6, 224, 224)
         state_hist = deque([q0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
         img_hist   = deque([img0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
         last_cmd = q0.astype(np.float64).copy()
@@ -365,7 +382,7 @@ class YAMRLEnvRunner:
             br_pre, _ = self.base_cam.get(); wr_pre, _ = self.wrist_cam.get()
             if br_pre is not None and wr_pre is not None:
                 b_p = _preprocess(br_pre); w_p = _preprocess(wr_pre)
-                img_pre = np.concatenate([b_p, w_p], axis=0)
+                img_pre = self._pack_policy_images(b_p, w_p)
                 state_hist.append(q_pre.copy())
                 img_hist.append(img_pre.copy())
 
@@ -410,7 +427,7 @@ class YAMRLEnvRunner:
                 br, _ = self.base_cam.get(); wr, _ = self.wrist_cam.get()
                 if br is not None and wr is not None:
                     b_p = _preprocess(br); w_p = _preprocess(wr)
-                    img_cur = np.concatenate([b_p, w_p], axis=0)
+                    img_cur = self._pack_policy_images(b_p, w_p)
                     state_hist.append(q_cur.copy())
                     img_hist.append(img_cur.copy())
 
@@ -445,6 +462,7 @@ class YAMRLEnvRunner:
             "rewards":  rewards,
             "dones":    dones,
             "success":  reward_val > 0.5,
+            "policy_camera_order": self.policy_camera_order,
         }
 
     # ---- main loop ----
@@ -501,7 +519,8 @@ class YAMRLEnvRunner:
                                 states=ep_data["states"],
                                 actions=ep_data["actions"],
                                 rewards=ep_data["rewards"],
-                                dones=ep_data["dones"])
+                                dones=ep_data["dones"],
+                                policy_camera_order=ep_data["policy_camera_order"])
 
             # Send episode to learner (send_transitions pickles internally — do NOT pre-pickle).
             self.actor_node.send_transitions(ep_data)
