@@ -152,6 +152,9 @@ def main():
     p.add_argument("--num-episodes", type=int, default=15,
                    help="target number of saved s/f episodes per checkpoint; "
                         "existing eval files count toward the target (0=unlimited)")
+    p.add_argument("--no-save", action="store_true",
+                   help="run live evaluation without writing images or trajectories; "
+                        "useful when recording with an external camera")
     p.add_argument("--max-episode-steps", type=int, default=None,
                    help="maximum diffusion-query chunks per episode; default comes "
                         "from YAM_MAX_EPISODE_STEPS / hardware config")
@@ -173,13 +176,14 @@ def main():
 
     log.info(
         "Eval config: run=%s policy_camera_order=%s preprocess=%s "
-        "max_episode_steps=%d episodes_per_ckpt=%s raw_policy=%s",
+        "max_episode_steps=%d episodes_per_ckpt=%s raw_policy=%s save=%s",
         RUN_NAME,
         hardware["policy_camera_order"],
         os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop"),
         max_episode_steps,
         args.num_episodes if args.num_episodes else "unlimited",
         args.raw_policy,
+        not args.no_save,
     )
 
     # Build the env runner with NO weights-watch path → it never auto-loads
@@ -256,8 +260,11 @@ def main():
             log.info("=== Eval mode: %s (training step=%d) ===", label, runner._actor_step)
 
         save_dir = os.path.join(args.out_root, label)
-        os.makedirs(save_dir, exist_ok=True)
-        existing = sorted(glob.glob(os.path.join(save_dir, "episode_*.npz")))
+        if args.no_save:
+            existing = []
+        else:
+            os.makedirs(save_dir, exist_ok=True)
+            existing = sorted(glob.glob(os.path.join(save_dir, "episode_*.npz")))
         ep_idx = len(existing)
         if ep_idx > 0:
             log.info("Resuming under %s (%d eval eps already saved)", save_dir, ep_idx)
@@ -272,7 +279,7 @@ def main():
                     else:                       tally[label]["f"] += 1
                 except Exception: pass
 
-        if args.num_episodes and ep_idx >= args.num_episodes:
+        if not args.no_save and args.num_episodes and ep_idx >= args.num_episodes:
             log.info(
                 "%s already has %d/%d saved eval episodes; choose another checkpoint",
                 label, ep_idx, args.num_episodes,
@@ -312,21 +319,25 @@ def main():
 
             ok = bool(ep_data["success"])
             tally[label]["s" if ok else "f"] += 1
-            ep_path = os.path.join(save_dir, f"episode_{ep_idx:04d}.npz")
-            try:
-                save_episode_atomic(ep_path, ep_data, runner.policy_camera_order)
-            except Exception:
-                log.exception("Failed to save %s; closing robot immediately", ep_path)
-                runner.close()
-                raise
             tot = tally[label]["s"] + tally[label]["f"]
             sr  = tally[label]["s"] / max(tot, 1) * 100.0
-            log.info("Saved %s  (success=%s)  → %s/%s = %.1f%%",
-                     os.path.basename(ep_path), ok, tally[label]["s"], tot, sr)
+            if args.no_save:
+                log.info("Not saved (--no-save; success=%s)  → %s/%s = %.1f%%",
+                         ok, tally[label]["s"], tot, sr)
+            else:
+                ep_path = os.path.join(save_dir, f"episode_{ep_idx:04d}.npz")
+                try:
+                    save_episode_atomic(ep_path, ep_data, runner.policy_camera_order)
+                except Exception:
+                    log.exception("Failed to save %s; closing robot immediately", ep_path)
+                    runner.close()
+                    raise
+                log.info("Saved %s  (success=%s)  → %s/%s = %.1f%%",
+                         os.path.basename(ep_path), ok, tally[label]["s"], tot, sr)
             ep_idx += 1
             runner._move_to_home()
 
-            if args.num_episodes and ep_idx >= args.num_episodes:
+            if not args.no_save and args.num_episodes and ep_idx >= args.num_episodes:
                 log.info(
                     "Completed %d/%d saved eval episodes for %s; "
                     "returning to checkpoint picker",
