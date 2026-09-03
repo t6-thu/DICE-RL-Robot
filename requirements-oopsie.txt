@@ -1,0 +1,4 @@
+# Latest PyPI release verified on 2026-09-02.
+# Install without --upgrade so uv keeps the robot environment's existing
+# NumPy/OpenCV/Click versions, which already satisfy Oopsie's lower bounds.
+oopsie-data-tools==1.0.1
