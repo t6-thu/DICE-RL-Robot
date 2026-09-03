@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Export every episode_*.npz in a directory to an mp4 (skipping chosen indices).
 
-Layout per frame: [base | wrist] stitched horizontally, like view_episode.py,
-but the base camera is cropped to its BOTTOM-LEFT 3/4 × 3/4 region and then
-resized back up to the wrist camera's resolution so the two panes match.
+Exports base, wrist, or [base | wrist] without text overlays. The base camera
+is cropped to its BOTTOM-LEFT 3/4 × 3/4 region and resized to the requested
+output size.
 
     base:  crop x∈[0, 3/4 W),  y∈[1/4 H, H)   → resize to (wrist_H, wrist_W)
     wrist: full frame
@@ -22,12 +22,22 @@ Usage:
 import argparse
 import glob
 import os
+import subprocess
 import sys
 
 import cv2
 import numpy as np
 
-CAMERA_SLICES = {"base": slice(0, 3), "wrist": slice(3, 6)}
+def _camera_slices(policy_camera_order):
+    """Return physical camera slices for the order stored in an episode."""
+    if policy_camera_order == "base_wrist":
+        return {"base": slice(0, 3), "wrist": slice(3, 6)}
+    if policy_camera_order == "wrist_base":
+        return {"wrist": slice(0, 3), "base": slice(3, 6)}
+    raise ValueError(
+        "policy_camera_order must be base_wrist or wrist_base, got "
+        f"{policy_camera_order!r}"
+    )
 
 
 def _to_uint8_rgb(rgb: np.ndarray) -> np.ndarray:
@@ -44,42 +54,91 @@ def _crop_bottom_left(frame: np.ndarray, fraction: float) -> np.ndarray:
     return frame[y1:h, 0:x2]
 
 
-def _render_frame(images, rewards, name, success, i, crop_fraction):
-    """Frame i → BGR uint8 (H, 2W, 3): [base(cropped+resized) | wrist]."""
-    base_full  = _to_uint8_rgb(images[i, CAMERA_SLICES["base"]])
-    wrist      = _to_uint8_rgb(images[i, CAMERA_SLICES["wrist"]])
-    wh, ww = wrist.shape[:2]
+def _resize_and_sharpen(frame, output_size, sharpen):
+    """Upscale for display and optionally apply a mild unsharp mask."""
+    if frame.shape[:2] != (output_size, output_size):
+        frame = cv2.resize(
+            frame, (output_size, output_size), interpolation=cv2.INTER_LANCZOS4
+        )
+    if sharpen > 0:
+        blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=1.0)
+        frame = cv2.addWeighted(frame, 1.0 + sharpen, blurred, -sharpen, 0)
+    return frame
+
+
+def _render_frame(images, i, crop_fraction, camera_slices, camera,
+                  output_size, sharpen):
+    """Render physical base, wrist, or [base | wrist], without overlays."""
+    base_full = _to_uint8_rgb(images[i, camera_slices["base"]])
+    wrist = _to_uint8_rgb(images[i, camera_slices["wrist"]])
 
     base_crop = _crop_bottom_left(base_full, crop_fraction)
-    base = cv2.resize(base_crop, (ww, wh), interpolation=cv2.INTER_AREA)
+    base = _resize_and_sharpen(base_crop, output_size, sharpen)
+    wrist = _resize_and_sharpen(wrist, output_size, sharpen)
 
     base_bgr  = cv2.cvtColor(base,  cv2.COLOR_RGB2BGR)
     wrist_bgr = cv2.cvtColor(wrist, cv2.COLOR_RGB2BGR)
-    side = np.concatenate([base_bgr, wrist_bgr], axis=1)
-
-    cv2.putText(side, "base", (8, wh - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(side, "wrist", (ww + 8, wh - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+    if camera == "base":
+        side = base_bgr
+    elif camera == "wrist":
+        side = wrist_bgr
+    else:
+        side = np.concatenate([base_bgr, wrist_bgr], axis=1)
     return side
 
 
-def export_one(path, out_dir, fps, crop_fraction):
-    d = np.load(path)
-    images  = d["images"]
-    rewards = d.get("rewards", np.zeros(len(images), dtype=np.float32))
+def export_one(path, out_dir, fps, crop_fraction, camera, output_size,
+               crf, sharpen, suffix):
+    with np.load(path, allow_pickle=False) as d:
+        images = d["images"]
+        rewards = d.get("rewards", np.zeros(len(images), dtype=np.float32))
+        policy_camera_order = (
+            str(np.asarray(d["policy_camera_order"]).item())
+            if "policy_camera_order" in d else "base_wrist"
+        )
+    camera_slices = _camera_slices(policy_camera_order)
     name    = os.path.splitext(os.path.basename(path))[0]
     success = bool(len(rewards) and rewards[-1] > 0.5)
-    T, _, H, W = images.shape
+    T = len(images)
 
-    # Output size = stitched [resized-base | wrist] = (H, 2W) since base→wrist size.
-    out_path = os.path.join(out_dir, f"{name}.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (W * 2, H))
-    for i in range(T):
-        writer.write(_render_frame(images, rewards, name, success, i, crop_fraction))
-    writer.release()
-    print(f"  {name}  [{'SUCCESS' if success else 'FAILURE'}]  {T} frames  → {out_path}")
+    # Use ffmpeg/libx264 instead of OpenCV's low-bitrate mp4v writer.  Upscaling
+    # does not invent detail, but it avoids poor player-side enlargement and
+    # CRF controls the actual compression quality.
+    out_path = os.path.join(out_dir, f"{name}{suffix}.mp4")
+    out_w = output_size * 2 if camera == "both" else output_size
+    command = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{out_w}x{output_size}", "-r", str(fps), "-i", "-",
+        "-an", "-c:v", "libx264", "-preset", "slow", "-crf", str(crf),
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path,
+    ]
+    try:
+        writer = subprocess.Popen(command, stdin=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError("high-quality export requires ffmpeg on PATH") from exc
+    try:
+        assert writer.stdin is not None
+        for i in range(T):
+            frame = _render_frame(
+                images, i, crop_fraction, camera_slices, camera,
+                output_size, sharpen,
+            )
+            writer.stdin.write(frame.tobytes())
+        writer.stdin.close()
+        if writer.wait() != 0:
+            raise RuntimeError(f"ffmpeg failed while writing {out_path}")
+    finally:
+        if writer.stdin is not None and not writer.stdin.closed:
+            writer.stdin.close()
+        if writer.poll() is None:
+            writer.kill()
+            writer.wait()
+    print(
+        f"  {name}  [{'SUCCESS' if success else 'FAILURE'}]  {T} frames  "
+        f"order={policy_camera_order} camera={camera} size={out_w}x{output_size} "
+        f"crf={crf} sharpen={sharpen:.2f} → {out_path}"
+    )
     return out_path
 
 
@@ -91,9 +150,27 @@ def main():
     p.add_argument("--out", default=None,
                    help="output dir (default: <dir>/mp4_exports)")
     p.add_argument("--fps", type=float, default=15.0)
+    p.add_argument("--camera", choices=["base", "wrist", "both"], default="both",
+                   help="physical camera view to export (default: both)")
     p.add_argument("--crop", type=float, default=0.75,
                    help="base bottom-left crop fraction (default 0.75 = 3/4)")
+    p.add_argument("--output-size", type=int, default=224,
+                   help="height/width of each camera pane (default: 224)")
+    p.add_argument("--crf", type=int, default=12,
+                   help="H.264 quality, lower is clearer/larger (default: 12)")
+    p.add_argument("--sharpen", type=float, default=0.0,
+                   help="unsharp-mask strength; 0 disables it (default: 0)")
+    p.add_argument("--suffix", default="",
+                   help="append to output basename, e.g. --suffix _hd_clean")
     args = p.parse_args()
+    if not 0 < args.crop <= 1:
+        p.error("--crop must be in (0, 1]")
+    if args.output_size <= 0:
+        p.error("--output-size must be > 0")
+    if not 0 <= args.crf <= 51:
+        p.error("--crf must be between 0 and 51")
+    if args.sharpen < 0:
+        p.error("--sharpen must be >= 0")
 
     if os.path.isfile(args.dir):
         files = [args.dir]
@@ -116,11 +193,18 @@ def main():
 
     print(f"Found {len(files)} episodes; skipping {sorted(skip_set)} "
           f"→ exporting {len(selected)}")
-    print(f"Base crop: bottom-left {args.crop:.0%}×{args.crop:.0%}, resized to wrist size")
+    print(
+        f"Base crop: bottom-left {args.crop:.0%}×{args.crop:.0%}; "
+        f"each pane resized to {args.output_size}x{args.output_size}"
+    )
     print(f"Output dir: {out_dir}\n")
 
     for f in selected:
-        export_one(f, out_dir, fps=args.fps, crop_fraction=args.crop)
+        export_one(
+            f, out_dir, fps=args.fps, crop_fraction=args.crop,
+            camera=args.camera, output_size=args.output_size,
+            crf=args.crf, sharpen=args.sharpen, suffix=args.suffix,
+        )
 
     print(f"\n✓ Done. {len(selected)} mp4s in {out_dir}")
 
