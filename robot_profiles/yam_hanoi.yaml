@@ -5,7 +5,7 @@
 # leaving it blank makes the preflight fail safely. Joint names/order come from
 # i2rt/i2rt/robot_models/yam/yam_4310_linear.xml and the runner's [:6] layout.
 
-policy_name:
+policy_name: dice_rl_hanoi_sparse_terminal_v1
 robot_name: yam
 gripper_name: linear_4310
 is_biarm: false
