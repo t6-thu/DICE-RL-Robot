@@ -137,6 +137,20 @@ class TestOopsieYamConversion(unittest.TestCase):
         )
         self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
 
+    def test_legacy_camera_order_requires_explicit_fallback(self) -> None:
+        path = self.make_episode()
+        with np.load(path) as archive:
+            arrays = {k: archive[k] for k in archive.files if k != "policy_camera_order"}
+        np.savez_compressed(path, **arrays)
+        with self.assertRaises(ValueError):
+            load_source_episode(path, self.normalization, 30)
+        episode = load_source_episode(path, self.normalization, 30, "base_wrist")
+        self.assertEqual(int(episode["base"][0, 0, 0, 0]), 25)
+        self.assertEqual(int(episode["wrist"][0, 0, 0, 0]), 200)
+        explicit = load_source_episode(self.make_episode(order="wrist_base"),
+                                       self.normalization, 30, "base_wrist")
+        self.assertEqual(int(explicit["wrist"][0, 0, 0, 0]), 25)
+
 
 if __name__ == "__main__":
     unittest.main()

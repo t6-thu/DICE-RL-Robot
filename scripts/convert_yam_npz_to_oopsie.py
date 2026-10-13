@@ -136,17 +136,21 @@ def denormalize(values: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.nda
 
 
 def load_source_episode(
-    path: Path, normalization: dict[str, np.ndarray], control_freq: float
+    path: Path, normalization: dict[str, np.ndarray], control_freq: float,
+    fallback_camera_order: str | None = None,
 ) -> dict[str, np.ndarray | str]:
     with np.load(path, allow_pickle=False) as archive:
-        required = {"images", "states", "actions", "policy_camera_order"}
+        required = {"images", "states", "actions"}
+        if fallback_camera_order is None:
+            required.add("policy_camera_order")
         missing = sorted(required - set(archive.files))
         if missing:
             raise ValueError(f"missing arrays: {missing}")
         images = np.asarray(archive["images"])
         states = np.asarray(archive["states"], dtype=np.float64)
         actions = np.asarray(archive["actions"], dtype=np.float64)
-        camera_order = str(np.asarray(archive["policy_camera_order"]).item())
+        camera_order = (str(np.asarray(archive["policy_camera_order"]).item())
+                        if "policy_camera_order" in archive else fallback_camera_order)
 
     if images.ndim != 4 or images.shape[1] != 6:
         raise ValueError(f"images must have shape (T,6,H,W), got {images.shape}")
@@ -213,8 +217,9 @@ def convert_one(
     operator_name: str,
     language_instruction: str,
     dry_run: bool,
+    fallback_camera_order: str | None = None,
 ) -> None:
-    episode = load_source_episode(source_path, normalization, profile.control_freq)
+    episode = load_source_episode(source_path, normalization, profile.control_freq, fallback_camera_order)
     if dry_run:
         return
 
@@ -307,6 +312,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalization", type=Path, required=True)
     parser.add_argument("--language-instruction", required=True)
     parser.add_argument("--operator-name", required=True)
+    parser.add_argument("--fallback-camera-order", choices=["base_wrist", "wrist_base"],
+                        help="Confirmed camera order for legacy files without metadata")
     parser.add_argument(
         "--recursive",
         action="store_true",
@@ -358,6 +365,7 @@ def main() -> int:
                 operator_name,
                 instruction,
                 args.dry_run,
+                args.fallback_camera_order,
             )
             verb = "CHECK" if args.dry_run else "WRITE"
             print(f"{verb} [{index}/{len(episodes)}] {episode_path} -> {h5_path}")
