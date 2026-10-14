@@ -11,6 +11,11 @@ Algorithm (one episode)
      delta     = residual_actor(features, noise)   # in normalized space
      final_act = bc_action + delta
 4. Denormalize → i2rt joint targets → command_joint_pos().
+   Real-time chunking: the loop ticks at control_hz and never blocks on the
+   policy. The next chunk is inferred in a worker thread while the current one
+   executes; the steps still to run are inpainted as a fixed prefix so the
+   hand-over is continuous (dice_rl/env_runner/rtc.py). Frames where no fresh
+   chunk was available are flagged action_valid=0 in the recording.
 5. After episode: user labels success/failure → reward = 1.0 / 0.0.
 6. Send episode (images, states, actions, rewards) to learner via ZMQ.
 7. Receive updated actor weights from learner.
@@ -25,6 +30,7 @@ import signal
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import cv2
@@ -32,6 +38,7 @@ import numpy as np
 import torch
 
 from dice_rl.communication.actor_node import Actor
+from dice_rl.env_runner.rtc import RTCScheduler
 from dice_rl.model.distill_rl import DistilledActor
 from utils.model_io import load_policy
 
@@ -182,6 +189,9 @@ class YAMRLEnvRunner:
         residual_scale: float = 1.0,  # scale on actor's delta — set <1 to soften RL effect
         max_joint_step: float = 0.08,
         raw_policy: bool = False,
+        # Real-time chunking
+        rtc_delay_steps: int = 3,
+        gil_switch_interval_s: float = 0.001,
         # Data & ZMQ
         online_data_dir: str = "/tmp/yam_rl_rollouts",
         rl_checkpoint_dir: str = None,
@@ -213,6 +223,20 @@ class YAMRLEnvRunner:
         self.residual_scale = None if self.raw_policy else float(residual_scale)
         self.max_joint_step = 0.0 if self.raw_policy else float(max_joint_step)
         self._last_delta_rms = 0.0
+        # RTC: inference budget in frames. The next chunk is requested when this
+        # many steps of the current chunk remain; those steps are frozen as the
+        # inpainting prefix. Inference slower than rtc_delay_steps/control_hz
+        # produces held frames (action_valid=0) instead of a stall.
+        self.rtc_delay_steps = int(rtc_delay_steps)
+        if not (0 <= self.rtc_delay_steps <= action_horizon - 2):
+            raise ValueError(
+                f"rtc_delay_steps must be in [0, {action_horizon - 2}], got {rtc_delay_steps}")
+        # Inference runs in one worker thread. i2rt's CAN control thread needs the
+        # GIL every ~4 ms; a shorter switch interval bounds how long the inference
+        # thread can hold it (default 5 ms would exceed the CAN period).
+        if gil_switch_interval_s and gil_switch_interval_s > 0:
+            sys.setswitchinterval(float(gil_switch_interval_s))
+        self._infer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc_infer")
         self.online_data_dir = online_data_dir
         self.rl_checkpoint_dir = rl_checkpoint_dir
         self._latest_weights_path = (
@@ -233,6 +257,13 @@ class YAMRLEnvRunner:
                 "max_joint_step=%.3f max_episode_steps=%d action_horizon=%d",
                 self.control_hz, self.residual_scale, self.max_joint_step,
                 self.max_episode_steps, self.action_horizon)
+        log.info(
+            "RTC: delay budget=%d frames (%.0f ms), max frames/episode=%d, "
+            "GIL switch interval=%.1f ms",
+            self.rtc_delay_steps, self.rtc_delay_steps * self.period * 1000.0,
+            self.max_episode_steps * action_horizon,
+            sys.getswitchinterval() * 1000.0,
+        )
         log.info(
             "Image preprocessing: %s",
             os.environ.get("YAM_IMAGE_PREPROCESS", "center_crop").strip().lower(),
@@ -369,8 +400,14 @@ class YAMRLEnvRunner:
         jnt  = torch.from_numpy(s_norm)[None].to(self.device).float()
         return {"sparse": {"rgb_0": rgb0, "rgb_1": rgb1, "joint_pos": jnt}}
 
-    def _infer(self, obs_tensors) -> np.ndarray:
-        """Run BC policy (+ optional residual actor) → (action_horizon, 7) raw i2rt."""
+    def _infer(self, obs_tensors, prefix_n: Optional[np.ndarray] = None) -> np.ndarray:
+        """Run BC policy (+ optional residual actor) → (action_horizon, 7) raw i2rt.
+
+        prefix_n: optional (n, 7) NORMALIZED actions already committed for the
+        first n steps of the chunk (RTC). They are inpainted into the BC sample
+        and the residual is zeroed on those steps so the returned chunk starts
+        with exactly these actions.
+        """
         # _make_obs_tensors already maps joint_pos into the normalized RL action
         # space used by the residual actor. Applying the BC policy normalizer
         # again would double-normalize HDF5-trained policies whose checkpoint
@@ -379,16 +416,26 @@ class YAMRLEnvRunner:
         features = self.bc_policy.obs_encoder(nobs)  # (1, feat_dim)
 
         noise = torch.randn(1, self.action_horizon, self.action_dim, device=self.device)
+        prefix_t = None
+        n_prefix = 0
+        if prefix_n is not None and len(prefix_n) > 0:
+            n_prefix = int(len(prefix_n))
+            prefix_t = torch.from_numpy(np.asarray(prefix_n, dtype=np.float32))[None].to(self.device)
         bc_act_n = self.bc_policy.predict_action_from_features(
             sparse_nobs_encode=features,
             init_noise=noise,
             unnormalize=False,
+            fixed_action_prefix=prefix_t,
         )["sparse"]  # (1, H, 7) normalized
 
         if self.actor is not None:
             delta = self.actor(features.unsqueeze(1), noise)
             if not self.raw_policy:
                 delta = delta * self.residual_scale
+            if n_prefix > 0:
+                # Committed steps must not move: the robot is already executing them.
+                delta = delta.clone()
+                delta[:, :n_prefix] = 0.0
             final_n = (bc_act_n + delta)
             self._last_delta_rms = float(delta.pow(2).mean().sqrt().item())
         else:
@@ -396,13 +443,64 @@ class YAMRLEnvRunner:
             self._last_delta_rms = 0.0
 
         final_n = final_n[0].cpu().numpy()          # (H, 7) normalized
+        if n_prefix > 0:
+            # Guard against float round-trip drift on the frozen steps.
+            final_n[:n_prefix] = prefix_n
         final   = self.action_norm.denormalize(final_n)  # (H, 7) i2rt raw
         return final
+
+    def _infer_async(self, obs_tensors, prefix_n: Optional[np.ndarray]):
+        """Submit `_infer` to the single inference worker thread.
+
+        Returns a Future resolving to (actions_raw, infer_ms, delta_rms).
+        """
+        def _job():
+            t0 = time.monotonic()
+            with torch.inference_mode():
+                act = self._infer(obs_tensors, prefix_n)  # .cpu() inside syncs the stream
+            return act, (time.monotonic() - t0) * 1000.0, self._last_delta_rms
+        return self._infer_pool.submit(_job)
+
+    def _clip_cmd(self, q_tgt: np.ndarray, last_cmd: np.ndarray) -> np.ndarray:
+        q_cmd = np.clip(q_tgt.astype(np.float64),
+                        [-2.767,-0.15,-0.15,-1.72,-1.72,-2.24,0.],
+                        [ 3.28,  3.80, 3.28, 1.72, 1.72, 2.24,1.5])
+        if self.max_joint_step > 0:
+            q_cmd = np.clip(
+                q_cmd,
+                last_cmd - self.max_joint_step,
+                last_cmd + self.max_joint_step,
+            )
+        return q_cmd
+
+    def _grab_frame(self, where: str):
+        """Poll both cameras; abort the episode if either is stale.
+
+        Returns (base_rgb, wrist_rgb) or None (abort flag set)."""
+        br, br_t = self.base_cam.get(); wr, wr_t = self.wrist_cam.get()
+        base_age, wrist_age = _camera_ages(br_t, wr_t)
+        if base_age > self.max_camera_age or wrist_age > self.max_camera_age:
+            log.error(
+                "stale camera %s: base_age=%.3fs wrist_age=%.3fs limit=%.3fs; "
+                "aborting episode", where, base_age, wrist_age, self.max_camera_age,
+            )
+            self._abort_episode["flag"] = True
+            return None
+        return br, wr
 
     # ---- episode loop ----
 
     def run_episode(self) -> dict:
-        """Execute one episode. Returns {images, states, actions, rewards, dones}."""
+        """Execute one episode with real-time chunking.
+
+        The control loop ticks at control_hz. Every tick sends exactly one joint
+        command and records exactly one transition. Inference for the next chunk
+        runs in a worker thread while the current chunk keeps executing; the
+        steps still to be executed are frozen as the inpainting prefix of the
+        new chunk so the hand-over is seamless (see dice_rl/env_runner/rtc.py).
+
+        Returns {images, states, actions, rewards, dones, timestamps, action_valid}.
+        """
         # pre-fill history. Cameras (esp. the USB-2 wrist sharing a hub with the
         # CAN adapter) can intermittently return None; retry for up to 5s instead
         # of crashing the whole run on a single dropped frame.
@@ -435,106 +533,119 @@ class YAMRLEnvRunner:
         img_hist   = deque([img0.copy()] * self.obs_horizon, maxlen=self.obs_horizon)
         last_cmd = q0.astype(np.float64).copy()
 
-        images_rec, states_rec, actions_rec, rewards_rec = [], [], [], []
+        images_rec, states_rec, actions_rec = [], [], []
+        ts_rec, valid_rec = [], []
+        infer_ms_log = []
         self._abort_episode["flag"] = False
         self._in_episode = True
 
-        for step in range(self.max_episode_steps):
-            if self._abort_episode["flag"]:
-                break
+        H = self.action_horizon
+        max_frames = self.max_episode_steps * H
+        sched = RTCScheduler(H, self.rtc_delay_steps)
 
-            # Refresh obs with current state right before inference to minimise
-            # the perception-action latency gap: without this refresh the obs
-            # would be the state at the END of the previous chunk's last step,
-            # but by then the robot has continued converging toward that step's
-            # target. The fresh read here captures the actual current position.
-            q_pre = self._read_state()
-            br_pre, br_pre_t = self.base_cam.get()
-            wr_pre, wr_pre_t = self.wrist_cam.get()
-            base_age, wrist_age = _camera_ages(br_pre_t, wr_pre_t)
-            if base_age > self.max_camera_age or wrist_age > self.max_camera_age:
-                log.error(
-                    "stale camera before inference: base_age=%.3fs wrist_age=%.3fs "
-                    "limit=%.3fs; aborting episode",
-                    base_age, wrist_age, self.max_camera_age,
-                )
-                self._abort_episode["flag"] = True
-                break
-            if br_pre is not None and wr_pre is not None:
-                b_p = _preprocess(br_pre); w_p = _preprocess(wr_pre)
-                img_pre = _pack_policy_images(
-                    b_p, w_p, self.policy_camera_order
-                )
-                state_hist.append(q_pre.copy())
-                img_hist.append(img_pre.copy())
+        # First chunk: nothing is executing yet, so infer synchronously and
+        # start the clock only once it is available. No frame is recorded
+        # before the clock starts, so no gap enters the data.
+        t_sync = time.monotonic()
+        with torch.inference_mode():
+            first = self._infer(self._make_obs_tensors(img_hist, state_hist), None)
+        infer_ms_log.append((time.monotonic() - t_sync) * 1000.0)
+        sched.reset(first)
 
-            # Anchor timing to obs capture — mirrors original's
-            # action_start_time_s = obs_raw["robot_time_stamps"][-1] which
-            # schedules action[i] for t_obs + i*period. After inference, any
-            # waypoints whose deadline has already passed are skipped, exactly
-            # as the original ManipServer does with timestamped waypoints.
-            t_obs = time.monotonic()
-            obs_t = self._make_obs_tensors(img_hist, state_hist)
-            with torch.no_grad():
-                actions = self._infer(obs_t)  # (H, 7) raw
-            infer_ms = (time.monotonic() - t_obs) * 1000.0
+        pending = None  # (future, InferenceRequest)
+        t0 = time.monotonic()
+        frame = 0
+        try:
+            while frame < max_frames and not self._abort_episode["flag"]:
+                # ---- pace to the frame grid ----
+                wait = t0 + frame * self.period - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                t_frame = time.monotonic()
 
-            # Skip waypoints already past-due: action[i] was planned for
-            # t_obs + i*period; skip any i whose deadline has passed.
-            skip_steps = min(int(infer_ms / 1000.0 / self.period),
-                             self.action_horizon - 1)
-
-            # Execute chunk anchored to t_obs (not post-inference chunk_start).
-            for actual_i in range(skip_steps, self.action_horizon):
-                if self._abort_episode["flag"]: break
-                now = time.monotonic()
-                wait = t_obs + actual_i * self.period - now
-                if wait > 0: time.sleep(wait)
-                q_tgt = actions[actual_i]
-
-                q_cmd = np.clip(q_tgt.astype(np.float64),
-                                [-2.767,-0.15,-0.15,-1.72,-1.72,-2.24,0.],
-                                [ 3.28,  3.80, 3.28, 1.72, 1.72, 2.24,1.5])
-                if self.max_joint_step > 0:
-                    q_cmd = np.clip(
-                        q_cmd,
-                        last_cmd - self.max_joint_step,
-                        last_cmd + self.max_joint_step,
-                    )
+                # ---- send this frame's command ----
+                q_tgt, valid = sched.action_for_frame(frame, last_cmd)
+                q_cmd = self._clip_cmd(np.asarray(q_tgt), last_cmd)
                 self.robot.command_joint_pos(q_cmd)
                 last_cmd = q_cmd.copy()
-                q_cur = self._read_state()
 
-                # update obs history at 30 Hz
-                br, br_t = self.base_cam.get(); wr, wr_t = self.wrist_cam.get()
-                base_age, wrist_age = _camera_ages(br_t, wr_t)
-                if base_age > self.max_camera_age or wrist_age > self.max_camera_age:
-                    log.error(
-                        "stale camera during action chunk: base_age=%.3fs "
-                        "wrist_age=%.3fs limit=%.3fs; aborting episode",
-                        base_age, wrist_age, self.max_camera_age,
-                    )
-                    self._abort_episode["flag"] = True
+                # ---- observe at 30 Hz ----
+                q_cur = self._read_state()
+                frames = self._grab_frame(f"at frame {frame}")
+                if frames is None:
                     break
+                br, wr = frames
                 if br is not None and wr is not None:
-                    b_p = _preprocess(br); w_p = _preprocess(wr)
                     img_cur = _pack_policy_images(
-                        b_p, w_p, self.policy_camera_order
+                        _preprocess(br), _preprocess(wr), self.policy_camera_order
                     )
                     state_hist.append(q_cur.copy())
                     img_hist.append(img_cur.copy())
 
-                # Record one raw single-step action per inner step.
+                # ---- record exactly one transition per frame ----
                 images_rec.append(img_hist[-1].copy())
                 states_rec.append(self.state_norm.normalize(state_hist[-1]))
                 actions_rec.append(self.action_norm.normalize(q_cmd))  # (7,)
+                ts_rec.append(t_frame - t0)
+                valid_rec.append(bool(valid))
+                if not valid:
+                    log.warning("[frame %4d] no fresh chunk; holding last target "
+                                "(action_valid=0)", frame)
 
-            log.info("[step %3d] infer=%.1fms skip=%d delta_rms=%.3f q=%s",
-                     step, infer_ms, skip_steps, self._last_delta_rms,
-                     np.round(self._read_state(), 3).tolist())
+                # ---- collect a finished inference ----
+                if pending is not None and pending[0].done():
+                    fut, req = pending
+                    pending = None
+                    try:
+                        act, ms, drms = fut.result()
+                    except Exception:
+                        log.exception("async inference failed; will relaunch")
+                        sched.cancel_in_flight()
+                    else:
+                        infer_ms_log.append(ms)
+                        adopted = sched.on_result(frame, req, act)
+                        log.info("[chunk obs@%4d] infer=%.1fms prefix=%d delta_rms=%.3f %s",
+                                 req.obs_frame, ms, len(req.prefix), drms,
+                                 "adopted" if adopted else "LATE/discarded")
+
+                # ---- launch the next inference on the fresh observation ----
+                if pending is None:
+                    req = sched.maybe_launch(frame, q_cmd)
+                    if req is not None:
+                        # The scheduler keeps the prefix in raw i2rt space; the
+                        # policy inpaints in normalized action space.
+                        prefix_n = self.action_norm.normalize(req.prefix).astype(np.float32)
+                        obs_t = self._make_obs_tensors(img_hist, state_hist)
+                        pending = (self._infer_async(obs_t, prefix_n), req)
+
+                frame += 1
+        finally:
+            if pending is not None:
+                try:
+                    pending[0].result(timeout=5.0)
+                except Exception:
+                    pass
+            self._in_episode = False
+
+        st = sched.stats
+        ts = np.asarray(ts_rec, dtype=np.float64)
+        if len(ts) > 1:
+            gaps = np.diff(ts)
+            n_late = int((gaps > 1.5 * self.period).sum())
+            log.info(
+                "Episode timing: frames=%d hold=%d launches=%d late=%d early_switch=%d "
+                "infer_ms mean=%.1f max=%.1f | frame gap mean=%.1fms max=%.1fms (>1.5x period: %d)",
+                st.frames, st.hold_frames, st.launches, st.late_results, st.early_switches,
+                float(np.mean(infer_ms_log)), float(np.max(infer_ms_log)),
+                float(gaps.mean() * 1000), float(gaps.max() * 1000), n_late,
+            )
+            if st.hold_frames > 0 or n_late > 0:
+                log.warning(
+                    "Episode had %d held frames and %d late frames: inference "
+                    "exceeded its %d-frame budget or the loop stalled. Consider a larger "
+                    "rtc_delay_steps.", st.hold_frames, n_late, self.rtc_delay_steps)
 
         # ---- user labels success/failure ----
-        self._in_episode = False
         import termios; termios.tcflush(sys.stdin, termios.TCIFLUSH)
         print("\nEpisode ended.  s=success  f=failure  d=discard: ", end="", flush=True)
         label = input().strip().lower()
@@ -554,6 +665,8 @@ class YAMRLEnvRunner:
             "actions":  np.stack(actions_rec).astype(np.float32), # (T,7) norm
             "rewards":  rewards,
             "dones":    dones,
+            "timestamps": ts,                                     # (T,) s since episode start
+            "action_valid": np.asarray(valid_rec, dtype=bool),    # (T,)
             "success":  reward_val > 0.5,
             "policy_camera_order": np.asarray(self.policy_camera_order),
         }
@@ -573,6 +686,10 @@ class YAMRLEnvRunner:
         if self._closed:
             return
         self._closed = True
+        try:
+            self._infer_pool.shutdown(wait=False)
+        except Exception:
+            pass
         try:
             self.base_cam.stop()
             self.wrist_cam.stop()
@@ -638,6 +755,8 @@ class YAMRLEnvRunner:
                                 actions=ep_data["actions"],
                                 rewards=ep_data["rewards"],
                                 dones=ep_data["dones"],
+                                timestamps=ep_data["timestamps"],
+                                action_valid=ep_data["action_valid"],
                                 policy_camera_order=np.asarray(self.policy_camera_order))
 
             # Disk is the authoritative transport for YAMRLLearner. Avoid also

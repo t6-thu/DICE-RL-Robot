@@ -120,6 +120,8 @@ def save_episode_atomic(ep_path: str, ep_data: dict, camera_order: str) -> None:
                 actions=ep_data["actions"],
                 rewards=ep_data["rewards"],
                 dones=ep_data["dones"],
+                timestamps=ep_data["timestamps"],
+                action_valid=ep_data["action_valid"],
                 policy_camera_order=np.asarray(camera_order),
             )
         os.replace(tmp_path, ep_path)

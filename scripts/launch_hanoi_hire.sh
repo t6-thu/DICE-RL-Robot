@@ -28,9 +28,9 @@ export YAM_NORM_NPZ="${YAM_HANOI_NORM_NPZ:-$HOME/文档/data/real_processed/stac
 export YAM_POLICY_CAMERA_ORDER="wrist_base"
 export YAM_IMAGE_PREPROCESS="center_crop"
 export YAM_MAX_CAMERA_AGE="${YAM_MAX_CAMERA_AGE:-0.5}"
-# Env runner counts diffusion-query chunks, not 30 Hz frames. Each chunk can
-# execute fewer than 16 waypoints when inference latency causes skipped steps,
-# so keep this comfortably above the demo horizon.
+# Env runner counts action chunks, not 30 Hz frames. With real-time chunking
+# every chunk executes exactly action_horizon (16) frames, so the episode cap is
+# YAM_MAX_EPISODE_STEPS * 16 frames (36 -> 576 frames = 19.2 s at 30 Hz).
 export YAM_MAX_EPISODE_STEPS="${YAM_MAX_EPISODE_STEPS:-36}"
 : "${YAM_HIRE_EXPERT_CURATION_PATH:=}"
 export YAM_HIRE_EXPERT_CURATION_PATH

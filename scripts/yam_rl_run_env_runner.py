@@ -28,6 +28,10 @@ _p.add_argument("--residual-scale", type=float, default=1.0,
 _p.add_argument("--max-joint-step", type=float, default=0.08,
                 help="Max absolute change per 30 Hz command per joint/gripper. "
                      "Use smaller values (0.04-0.06) when debugging motor loss.")
+_p.add_argument("--rtc-delay-steps", type=int, default=3,
+                help="RTC inference budget in control frames (3 = 100 ms at 30 Hz). "
+                     "The next chunk is requested when this many steps remain and "
+                     "those steps are frozen as the inpainting prefix.")
 _args, _ = _p.parse_known_args()
 
 runner = YAMRLEnvRunner(
@@ -38,6 +42,7 @@ runner = YAMRLEnvRunner(
     actor_hidden_dims      = NETWORK["actor_hidden_dims"],
     residual_scale         = _args.residual_scale,
     max_joint_step         = _args.max_joint_step,
+    rtc_delay_steps        = _args.rtc_delay_steps,
     obs_horizon            = TRAINING["obs_horizon"],
     action_horizon         = TRAINING["action_horizon"],
     action_dim             = TRAINING["action_dim"],

@@ -35,6 +35,20 @@ import torch
 log = logging.getLogger(__name__)
 
 
+
+def chunk_valid_mask(action_valid: np.ndarray, horizon: int) -> np.ndarray:
+    """(T,) bool → (T-H,) bool: True where A[t:t+H] contains only valid actions."""
+    action_valid = np.asarray(action_valid, dtype=bool)
+    T = len(action_valid)
+    n = T - horizon
+    if n <= 0:
+        return np.zeros(0, dtype=bool)
+    invalid = (~action_valid).astype(np.int64)
+    csum = np.concatenate([[0], np.cumsum(invalid)])
+    window_invalid = csum[horizon:horizon + n] - csum[:n]
+    return window_invalid == 0
+
+
 class YAMReplayBuffer:
     """Simple RLPD-compatible replay buffer for YAM joint-space policy."""
 
@@ -398,6 +412,10 @@ class YAMReplayBuffer:
           actions : (T, 7) float32 normalized  ← dense single-step actions
           rewards : (T,) float32
           dones   : (T,) bool
+          action_valid : (T,) bool, optional. False marks frames where the
+                    runner had no fresh policy command and held the previous
+                    target (e.g. an RTC inference that overran its budget).
+                    A transition at t is only used when A[t:t+H] is all valid.
 
         Fine-stride chunk sampling (mirrors original DICE-RL's
         _process_complete_episode):
@@ -441,6 +459,14 @@ class YAMReplayBuffer:
                 f"states={T} actions={len(A)} rewards={len(R_sparse)} "
                 f"dones={len(D)} images={len(I)}"
             )
+        if "action_valid" in episode:
+            action_valid = np.ascontiguousarray(episode["action_valid"], dtype=bool)
+            if len(action_valid) != T:
+                raise ValueError(
+                    f"action_valid length {len(action_valid)} != episode length {T}"
+                )
+        else:
+            action_valid = np.ones(T, dtype=bool)
 
         if T <= H:
             log.debug("Episode too short (%d frames) for even one chunk, skipping", T)
@@ -509,8 +535,17 @@ class YAMReplayBuffer:
             "success": success,
         }
         self._online_episode_refcounts[episode_id] = 0
+        valid_t = chunk_valid_mask(action_valid, H)
         for t in range(T - H):
-            self._append_online_ref(episode_id, t)
+            if valid_t[t]:
+                self._append_online_ref(episode_id, t)
+        n_dropped = int(T - H - valid_t.sum())
+        if n_dropped > 0:
+            log.info(
+                "Online episode %d: dropped %d/%d transitions whose action chunk "
+                "overlaps a held (action_valid=False) frame",
+                episode_index, n_dropped, T - H,
+            )
 
         self._num_online_episodes += 1
         if self.hire_shaper is not None and hasattr(

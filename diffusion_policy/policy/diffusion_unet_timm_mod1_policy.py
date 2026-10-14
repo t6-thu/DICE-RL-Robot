@@ -21,6 +21,33 @@ from utils.data_plotting import plot_ts_action
 from utils.trajectory import LinearInterpolator
 
 
+
+def build_prefix_condition(
+    cond_data: torch.Tensor, cond_mask: torch.Tensor, prefix: torch.Tensor
+):
+    """Fill the first `n` steps of an (B, H, D) condition with `prefix` (B, n, D).
+
+    Returns new (cond_data, cond_mask). `n` must satisfy 0 < n < H so at least
+    one step remains free for the policy to generate.
+    """
+    if prefix.dim() != 3:
+        raise ValueError(f"fixed_action_prefix must be (B, n, D); got {tuple(prefix.shape)}")
+    B, H, D = cond_data.shape
+    n = prefix.shape[1]
+    if prefix.shape[0] != B or prefix.shape[2] != D:
+        raise ValueError(
+            f"fixed_action_prefix shape {tuple(prefix.shape)} does not match "
+            f"condition (B={B}, D={D})"
+        )
+    if not (0 < n < H):
+        raise ValueError(f"fixed_action_prefix length must be in (0, {H}); got {n}")
+    cond_data = cond_data.clone()
+    cond_mask = cond_mask.clone()
+    cond_data[:, :n] = prefix.to(device=cond_data.device, dtype=cond_data.dtype)
+    cond_mask[:, :n] = True
+    return cond_data, cond_mask
+
+
 class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
     def __init__(
         self,
@@ -518,6 +545,7 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
         sparse_nobs_encode: torch.Tensor,
         init_noise: torch.Tensor = None,
         unnormalize: bool = True,
+        fixed_action_prefix: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Predict actions using pre-encoded visual features.
@@ -529,6 +557,12 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
                         shape: (B, action_horizon, action_dim)
             unnormalize: if True, unnormalize predicted actions before returning.
                         If False, return normalized actions (for residual RL training).
+            fixed_action_prefix: optional NORMALIZED actions of shape (B, n, action_dim)
+                        with 0 < n < action_horizon. The first n steps of the
+                        chunk are clamped to these values at every denoising
+                        step (inpainting), so the remainder is completed
+                        consistently with actions already being executed
+                        (real-time chunking).
 
         Returns:
             result: Dict with 'sparse' key containing predicted actions
@@ -543,6 +577,10 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
             dtype=self.dtype,
         )
         cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+        if fixed_action_prefix is not None:
+            cond_data, cond_mask = build_prefix_condition(
+                cond_data, cond_mask, fixed_action_prefix
+            )
 
         # run sampling
         sparse_naction_pred = self.conditional_sample(
